@@ -1,0 +1,516 @@
+# 05_hard_test_overfitting_check.py
+# ------------------------------------------------------------
+# Step 5: Hard Test & Overfitting prüfen
+#
+# Inputs:
+#   artifacts_step4/best_model.keras
+#   artifacts_step4/train_history.json
+#   artifacts_step3/val_norm.npz
+#   artifacts_step3/test_norm.npz
+#   artifacts_step1/metadata.json (optional für Klassennamen)
+#
+# Outputs (Deutsch):
+#   artifacts_step5/report_de.txt
+#   artifacts_step5/metrics.json
+#   artifacts_step5/confusion_matrix.csv
+#   artifacts_step5/hardtests.csv
+#   artifacts_step5/learning_curves.png (optional, wenn matplotlib verfügbar)
+#
+# Installation:
+#   pip install tensorflow numpy scikit-learn matplotlib
+# ------------------------------------------------------------
+
+import argparse
+import csv
+import json
+import os
+from typing import Dict, Tuple, Optional, List
+
+import numpy as np
+
+import tensorflow as tf
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    classification_report,
+    f1_score,
+    precision_recall_fscore_support,
+)
+
+
+# ----------------------------- I/O -----------------------------
+
+def load_npz(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+    d = np.load(path)
+    if "X" not in d or "y" not in d:
+        raise ValueError(f"NPZ muss Keys X und y enthalten: {path}")
+    X = d["X"].astype(np.float32, copy=False)
+    y = d["y"].astype(np.int64, copy=False)
+    if X.ndim != 3 or X.shape[2] != 6:
+        raise ValueError(f"X muss [N,T,6] sein. Bekommen: {X.shape} in {path}")
+    if y.ndim != 1 or y.shape[0] != X.shape[0]:
+        raise ValueError(f"y muss [N] sein und zu X passen. X:{X.shape} y:{y.shape}")
+    return X, y
+
+
+def try_load_classnames(meta_path: str) -> Optional[List[str]]:
+    if not meta_path or not os.path.isfile(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if "classes" in meta and isinstance(meta["classes"], list) and len(meta["classes"]) > 0:
+            return [str(x) for x in meta["classes"]]
+    except Exception:
+        return None
+    return None
+
+
+def load_history(path: str) -> Dict[str, List[float]]:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"train_history.json nicht gefunden: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        hist = json.load(f)
+    # Keras history ist dict[str, list]
+    return hist
+
+
+def write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def write_csv_matrix(path: str, cm: np.ndarray, class_names: List[str]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([""] + class_names)
+        for i, row in enumerate(cm):
+            w.writerow([class_names[i]] + [int(x) for x in row])
+
+
+# ----------------------------- Overfitting Analyse -----------------------------
+
+def summarize_overfitting(history: Dict[str, List[float]]) -> Dict[str, float]:
+    """
+    Liefert:
+    - beste val_acc, zugehörige Epoche
+    - train_acc und val_acc an dieser Epoche
+    - generalization gap (train_acc - val_acc)
+    - analog für loss
+    """
+    # robuste Keys: acc vs sparse_categorical_accuracy etc.
+    # Wir nutzen die Keys aus Step 4: "acc", "val_acc", "loss", "val_loss"
+    if "val_acc" not in history or "acc" not in history:
+        # Fallback: suche nach accuracy keys
+        acc_key = None
+        val_acc_key = None
+        for k in history.keys():
+            if k.endswith("accuracy") and not k.startswith("val_"):
+                acc_key = k
+            if k.startswith("val_") and k.endswith("accuracy"):
+                val_acc_key = k
+        if acc_key and val_acc_key:
+            history = dict(history)
+            history["acc"] = history[acc_key]
+            history["val_acc"] = history[val_acc_key]
+        else:
+            raise ValueError("Konnte acc/val_acc nicht im History-File finden.")
+
+    val_acc = np.array(history["val_acc"], dtype=np.float32)
+    acc = np.array(history["acc"], dtype=np.float32)
+    val_loss = np.array(history.get("val_loss", []), dtype=np.float32)
+    loss = np.array(history.get("loss", []), dtype=np.float32)
+
+    best_epoch = int(np.argmax(val_acc))
+    best_val_acc = float(val_acc[best_epoch])
+    train_acc_at_best = float(acc[best_epoch]) if best_epoch < len(acc) else float(acc[-1])
+
+    out = {
+        "best_epoch_1based": float(best_epoch + 1),
+        "best_val_acc": best_val_acc,
+        "train_acc_at_best": train_acc_at_best,
+        "acc_gap_at_best": float(train_acc_at_best - best_val_acc),
+    }
+
+    if len(val_loss) > 0 and len(loss) > 0 and best_epoch < len(val_loss) and best_epoch < len(loss):
+        out.update({
+            "val_loss_at_best": float(val_loss[best_epoch]),
+            "train_loss_at_best": float(loss[best_epoch]),
+            "loss_gap_at_best": float(val_loss[best_epoch] - loss[best_epoch]),
+        })
+    return out
+
+
+def maybe_plot_learning_curves(history: Dict[str, List[float]], out_png: str) -> bool:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return False
+
+    # minimal: accuracy + loss plots (ohne seaborn, ohne Farb-Vorgaben)
+    acc = history.get("acc", None)
+    val_acc = history.get("val_acc", None)
+    loss = history.get("loss", None)
+    val_loss = history.get("val_loss", None)
+
+    if acc is None or val_acc is None:
+        return False
+
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+
+    # Accuracy
+    plt.figure()
+    plt.plot(acc, label="Train Acc")
+    plt.plot(val_acc, label="Val Acc")
+    plt.xlabel("Epoche")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png.replace(".png", "_acc.png"), dpi=140)
+    plt.close()
+
+    # Loss
+    if loss is not None and val_loss is not None:
+        plt.figure()
+        plt.plot(loss, label="Train Loss")
+        plt.plot(val_loss, label="Val Loss")
+        plt.xlabel("Epoche")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_png.replace(".png", "_loss.png"), dpi=140)
+        plt.close()
+
+    return True
+
+
+# ----------------------------- Inferenz & Metriken -----------------------------
+
+def predict_classes(model: tf.keras.Model, X: np.ndarray, batch_size: int = 256) -> np.ndarray:
+    probs = model.predict(X, batch_size=batch_size, verbose=0)
+    return np.argmax(probs, axis=1).astype(np.int64)
+
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, class_names: List[str]) -> Dict:
+    acc = float(accuracy_score(y_true, y_pred))
+    f1_macro = float(f1_score(y_true, y_pred, average="macro"))
+    f1_weighted = float(f1_score(y_true, y_pred, average="weighted"))
+
+    pr, rc, f1, supp = precision_recall_fscore_support(y_true, y_pred, labels=np.arange(len(class_names)), zero_division=0)
+
+    per_class = []
+    for i, name in enumerate(class_names):
+        per_class.append({
+            "class_id": int(i),
+            "class_name": name,
+            "precision": float(pr[i]),
+            "recall": float(rc[i]),
+            "f1": float(f1[i]),
+            "support": int(supp[i]),
+        })
+
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(class_names))).astype(int)
+
+    return {
+        "accuracy": acc,
+        "f1_macro": f1_macro,
+        "f1_weighted": f1_weighted,
+        "per_class": per_class,
+        "confusion_matrix": cm.tolist(),
+        "sklearn_report": classification_report(
+            y_true, y_pred, target_names=class_names, digits=4, zero_division=0
+        ),
+    }
+
+
+# ----------------------------- Hard Tests (Stress) -----------------------------
+
+def hardtest_apply(X: np.ndarray, rng: np.random.Generator, mode: str, strength: float) -> np.ndarray:
+    """
+    X: [N,T,C], normalisiert
+    strength: interpretiert je nach mode
+    """
+    X2 = X.copy()
+    N, T, C = X2.shape
+
+    if mode == "jitter":
+        sigma = float(strength)  # z.B. 0.05
+        noise = rng.normal(0.0, sigma, size=X2.shape).astype(np.float32)
+        X2 += noise
+
+    elif mode == "scaling":
+        scale_sigma = float(strength)  # z.B. 0.10 => gains ~ 1 +/- 0.10
+        gains = (1.0 + rng.normal(0.0, scale_sigma, size=(1, 1, C))).astype(np.float32)
+        X2 *= gains
+
+    elif mode == "timeshift":
+        # strength in Anteil der Fensterlänge (z.B. 0.10)
+        max_shift = int(round(float(strength) * T))
+        max_shift = max(1, max_shift)
+        shift = int(rng.integers(-max_shift, max_shift + 1))
+        X2 = np.roll(X2, shift=shift, axis=1).astype(np.float32)
+
+    elif mode == "dropout_block":
+        # strength in Anteil der Fensterlänge (z.B. 0.08)
+        block = int(round(float(strength) * T))
+        block = max(1, min(block, T - 1))
+        start = int(rng.integers(0, T - block))
+        X2[:, start:start + block, :] = 0.0
+
+    elif mode == "channel_dropout":
+        # strength = Wahrscheinlichkeit je Kanal, dass er genullt wird
+        p = float(strength)
+        mask = (rng.random((C,)) >= p).astype(np.float32)  # 1 = keep
+        X2 *= mask.reshape(1, 1, C)
+
+    else:
+        raise ValueError(f"Unbekannter Hardtest-Mode: {mode}")
+
+    return X2.astype(np.float32, copy=False)
+
+
+def run_hardtests(
+    model: tf.keras.Model,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    class_names: List[str],
+    seed: int
+) -> List[Dict]:
+    rng = np.random.default_rng(seed)
+
+    # Stufen bewusst moderat -> realistische Stress-Szenarien
+    tests = [
+        ("baseline", None, 0.0),
+
+        ("jitter_low", "jitter", 0.03),
+        ("jitter_med", "jitter", 0.06),
+
+        ("scaling_low", "scaling", 0.05),
+        ("scaling_med", "scaling", 0.10),
+
+        ("timeshift_5pct", "timeshift", 0.05),
+        ("timeshift_10pct", "timeshift", 0.10),
+
+        ("dropout_block_5pct", "dropout_block", 0.05),
+        ("dropout_block_10pct", "dropout_block", 0.10),
+
+        ("channel_dropout_10pct", "channel_dropout", 0.10),
+        ("channel_dropout_20pct", "channel_dropout", 0.20),
+    ]
+
+    results = []
+    for name, mode, strength in tests:
+        if mode is None:
+            X_use = X_test
+        else:
+            X_use = hardtest_apply(X_test, rng, mode=mode, strength=strength)
+
+        y_pred = predict_classes(model, X_use)
+        acc = float(accuracy_score(y_test, y_pred))
+        f1m = float(f1_score(y_test, y_pred, average="macro"))
+        results.append({
+            "test": name,
+            "mode": mode if mode else "none",
+            "strength": float(strength),
+            "accuracy": acc,
+            "f1_macro": f1m,
+        })
+
+    return results
+
+
+def write_hardtests_csv(path: str, rows: List[Dict]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    keys = ["test", "mode", "strength", "accuracy", "f1_macro"]
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+# ----------------------------- Report (Deutsch) -----------------------------
+
+def build_report_de(
+    overfit: Dict[str, float],
+    val_metrics: Dict,
+    test_metrics: Dict,
+    hardtests: List[Dict],
+    class_names: List[str]
+) -> str:
+    lines = []
+    lines.append("Step 5 Report: Hard Test & Overfitting-Prüfung")
+    lines.append("")
+
+    lines.append("1) Overfitting-Analyse (aus Training/Validation-Verlauf)")
+    lines.append(f"- Beste Epoche (1-basiert): {int(overfit.get('best_epoch_1based', 0))}")
+    lines.append(f"- Beste Val-Accuracy: {overfit.get('best_val_acc', float('nan')):.4f}")
+    lines.append(f"- Train-Accuracy an bester Epoche: {overfit.get('train_acc_at_best', float('nan')):.4f}")
+    lines.append(f"- Generalization Gap (Train - Val): {overfit.get('acc_gap_at_best', float('nan')):.4f}")
+    if "val_loss_at_best" in overfit:
+        lines.append(f"- Val-Loss an bester Epoche: {overfit['val_loss_at_best']:.4f}")
+        lines.append(f"- Train-Loss an bester Epoche: {overfit['train_loss_at_best']:.4f}")
+        lines.append(f"- Loss Gap (Val - Train): {overfit['loss_gap_at_best']:.4f}")
+
+    # Einfache Interpretation
+    gap = overfit.get("acc_gap_at_best", 0.0)
+    lines.append("")
+    lines.append("Interpretation (Daumenregel):")
+    if gap >= 0.10:
+        lines.append("- Der Gap ist relativ groß. Das sieht nach Overfitting aus.")
+    elif gap >= 0.05:
+        lines.append("- Der Gap ist spürbar. Leichtes bis moderates Overfitting möglich.")
+    else:
+        lines.append("- Der Gap ist klein. Overfitting ist eher unkritisch.")
+    lines.append("")
+
+    lines.append("2) Validierung (Val) und finaler Test (Test)")
+    lines.append(f"- Val Accuracy:  {val_metrics['accuracy']:.4f} | F1 macro: {val_metrics['f1_macro']:.4f}")
+    lines.append(f"- Test Accuracy: {test_metrics['accuracy']:.4f} | F1 macro: {test_metrics['f1_macro']:.4f}")
+    lines.append("")
+    lines.append("Klassenspezifische Kennzahlen (Test):")
+    for c in test_metrics["per_class"]:
+        lines.append(
+            f"- {c['class_name']} (id={c['class_id']}): "
+            f"Precision={c['precision']:.3f}, Recall={c['recall']:.3f}, F1={c['f1']:.3f}, Support={c['support']}"
+        )
+
+    lines.append("")
+    lines.append("3) Hard Tests (Robustheit unter Störungen)")
+    # Sortiere nach absteigender Härte (niedrige accuracy zuerst)
+    hard_sorted = sorted(hardtests, key=lambda r: r["accuracy"])
+    for r in hard_sorted:
+        lines.append(f"- {r['test']}: Accuracy={r['accuracy']:.4f}, F1_macro={r['f1_macro']:.4f}")
+
+    lines.append("")
+    lines.append("Hinweis:")
+    lines.append("Wenn die Hard-Tests stark einbrechen, ist das meist ein Zeichen, dass")
+    lines.append("die Vorverarbeitung, Augmentation oder das Modell noch nicht robust genug ist.")
+    lines.append("In Step 6 optimieren wir dann gezielt (z.B. mehr Regularisierung, andere Fenster, bessere Augmentation).")
+
+    return "\n".join(lines)
+
+
+# ----------------------------- Main -----------------------------
+
+def main(
+    step1_meta: str,
+    in_step3: str,
+    in_step4: str,
+    out_dir: str,
+    batch_size: int,
+    seed: int
+) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+
+    class_names = try_load_classnames(step1_meta)
+    # Fallback, falls metadata fehlt
+    if class_names is None:
+        # Wir bestimmen Anzahl Klassen aus Labels
+        _, y_tmp = load_npz(os.path.join(in_step3, "test_norm.npz"))
+        k = int(y_tmp.max() + 1)
+        class_names = [f"Klasse_{i}" for i in range(k)]
+
+    # Load data
+    X_val, y_val = load_npz(os.path.join(in_step3, "val_norm.npz"))
+    X_test, y_test = load_npz(os.path.join(in_step3, "test_norm.npz"))
+
+    # Load model + history
+    model_path = os.path.join(in_step4, "best_model.keras")
+    hist_path = os.path.join(in_step4, "train_history.json")
+
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Model nicht gefunden: {model_path}")
+
+    model = tf.keras.models.load_model(model_path)
+    history = load_history(hist_path)
+
+    # Overfitting summary
+    overfit = summarize_overfitting(history)
+
+    # Val metrics
+    y_val_pred = predict_classes(model, X_val, batch_size=batch_size)
+    val_metrics = compute_metrics(y_val, y_val_pred, class_names)
+
+    # Test metrics
+    y_test_pred = predict_classes(model, X_test, batch_size=batch_size)
+    test_metrics = compute_metrics(y_test, y_test_pred, class_names)
+
+    # Confusion matrix CSV (Test)
+    cm = np.array(test_metrics["confusion_matrix"], dtype=int)
+    write_csv_matrix(os.path.join(out_dir, "confusion_matrix.csv"), cm, class_names)
+
+    # Hard tests
+    hardtests = run_hardtests(model, X_test, y_test, class_names, seed=seed)
+    write_hardtests_csv(os.path.join(out_dir, "hardtests.csv"), hardtests)
+
+    # Learning curves plot (optional)
+    plotted = maybe_plot_learning_curves(history, os.path.join(out_dir, "learning_curves.png"))
+
+    # Report text (Deutsch)
+    report = build_report_de(overfit, val_metrics, test_metrics, hardtests, class_names)
+    write_text(os.path.join(out_dir, "report_de.txt"), report)
+
+    # metrics.json
+    metrics = {
+        "overfitting": overfit,
+        "val": {
+            "accuracy": val_metrics["accuracy"],
+            "f1_macro": val_metrics["f1_macro"],
+            "f1_weighted": val_metrics["f1_weighted"],
+        },
+        "test": {
+            "accuracy": test_metrics["accuracy"],
+            "f1_macro": test_metrics["f1_macro"],
+            "f1_weighted": test_metrics["f1_weighted"],
+        },
+        "hardtests": hardtests,
+        "notes_de": {
+            "plots_created": bool(plotted),
+            "model_used": model_path,
+        }
+    }
+    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    # Console summary (Deutsch)
+    print("Step 5 abgeschlossen: Hard Test & Overfitting prüfen")
+    print(f"Output: {out_dir}")
+    print(f"Val  Accuracy={val_metrics['accuracy']:.4f} | F1_macro={val_metrics['f1_macro']:.4f}")
+    print(f"Test Accuracy={test_metrics['accuracy']:.4f} | F1_macro={test_metrics['f1_macro']:.4f}")
+    print(f"Generalization Gap (Train - Val) an bester Epoche: {overfit.get('acc_gap_at_best', float('nan')):.4f}")
+    if plotted:
+        print("Learning Curves: learning_curves_acc.png und learning_curves_loss.png gespeichert.")
+    print("Artefakte:")
+    print("  report_de.txt, metrics.json, confusion_matrix.csv, hardtests.csv")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Step 5: Hard Test & Overfitting prüfen")
+    p.add_argument("--step1_meta", type=str, default="./artifacts_step1/metadata.json",
+                   help="Optional: metadata.json aus Step 1 (für Klassennamen).")
+    p.add_argument("--in_step3", type=str, default="./artifacts_step3",
+                   help="Ordner mit val_norm.npz und test_norm.npz.")
+    p.add_argument("--in_step4", type=str, default="./artifacts_step4",
+                   help="Ordner mit best_model.keras und train_history.json.")
+    p.add_argument("--out_dir", type=str, default="./artifacts_step5",
+                   help="Output-Ordner.")
+    p.add_argument("--batch_size", type=int, default=256, help="Batch size für Inferenz.")
+    p.add_argument("--seed", type=int, default=202, help="Seed für Hard Tests.")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(
+        step1_meta=args.step1_meta,
+        in_step3=args.in_step3,
+        in_step4=args.in_step4,
+        out_dir=args.out_dir,
+        batch_size=args.batch_size,
+        seed=args.seed
+    )
