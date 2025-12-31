@@ -1,0 +1,202 @@
+# 02_offsetremove_normalize.py
+# ------------------------------------------------------------
+# Step 2: Offset Removal & Normalisierung
+#
+# Motivation (ATOMS3 auf Fahrrad/Anhänger):
+# - Während der Aufnahmen kann sich die Lage/Achse leicht ändern.
+# - Zusätzlich gibt es Bias/Drift (Gyro-Bias, Acc-Offset, Montage-Spannung).
+#
+# Strategie (bewusst simpel, robust, ATOMS3-kompatibel):
+# 1) Offset Removal pro Window: Subtrahiere pro Kanal den Mittelwert über die Zeit.
+#    -> entfernt DC-Komponente (Bias, Gravity-Offset im Fenster, langsame Drift).
+# 2) Normalisierung: kanalweise Standardisierung (mean/std) basierend auf Train-Set
+#    -> Val/Test nutzen dieselben Parameter (keine Datenleckage).
+#
+# Outputs:
+# - train_norm.npz, val_norm.npz, test_norm.npz
+# - norm_params.json (mean/std/eps + Settings)
+#
+# Input erwartet (aus Step 1):
+# - train_raw.npz, val_raw.npz, test_raw.npz
+#   jeweils mit X: [N, T, 6] und y: [N]
+# ------------------------------------------------------------
+
+import argparse
+import json
+import os
+from typing import Dict, Tuple
+
+import numpy as np
+
+
+SENSOR_COLS_STD = ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"]
+
+
+def load_npz(path: str) -> Tuple[np.ndarray, np.ndarray]:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+    d = np.load(path)
+    if "X" not in d or "y" not in d:
+        raise ValueError(f"NPZ muss Keys X und y enthalten: {path}")
+    X = d["X"]
+    y = d["y"]
+    if X.ndim != 3 or X.shape[2] != 6:
+        raise ValueError(f"X muss Shape [N, T, 6] haben. Bekommen: {X.shape} in {path}")
+    if y.ndim != 1 or y.shape[0] != X.shape[0]:
+        raise ValueError(f"y muss Shape [N] haben und zu X passen. X:{X.shape} y:{y.shape} in {path}")
+    return X.astype(np.float32, copy=False), y.astype(np.int64, copy=False)
+
+
+def save_npz(path: str, X: np.ndarray, y: np.ndarray) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez_compressed(path, X=X.astype(np.float32, copy=False), y=y.astype(np.int64, copy=False))
+
+
+def offset_remove_per_window(X: np.ndarray) -> np.ndarray:
+    """
+    Offset Removal pro Window:
+    Für jedes Window und jeden Kanal: x(t) := x(t) - mean_t(x)
+    """
+    # X: [N, T, C]
+    mu = X.mean(axis=1, keepdims=True, dtype=np.float32)  # [N, 1, C]
+    return (X - mu).astype(np.float32, copy=False)
+
+
+def compute_train_norm_params(X_train: np.ndarray, eps: float = 1e-6) -> Dict[str, np.ndarray]:
+    """
+    Berechnet kanalweise mean/std (über alle Samples und alle Zeitpunkte) aus dem Train-Set.
+    """
+    # Flatten über N und T: [N*T, C]
+    flat = X_train.reshape(-1, X_train.shape[2]).astype(np.float32, copy=False)
+    mean = flat.mean(axis=0, dtype=np.float32)  # [C]
+    std = flat.std(axis=0, dtype=np.float32)    # [C]
+
+    # Schutz gegen std==0
+    std = np.maximum(std, np.float32(eps))
+    return {"mean": mean, "std": std}
+
+
+def apply_standardization(X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """
+    Kanalweise Standardisierung: (X - mean) / std
+    mean/std: [C]
+    """
+    # Broadcasting: [N,T,C] - [C]
+    return ((X - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)).astype(np.float32, copy=False)
+
+
+def clip_values(X: np.ndarray, clip: float) -> np.ndarray:
+    """
+    Optionales Clipping für Stabilität (hilft oft beim Training kleiner Netze).
+    clip<=0 => kein Clipping.
+    """
+    if clip is None or clip <= 0:
+        return X
+    return np.clip(X, -clip, clip).astype(np.float32, copy=False)
+
+
+def process_split(
+    X: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    clip: float
+) -> np.ndarray:
+    # 1) Offset Removal pro Window
+    X1 = offset_remove_per_window(X)
+    # 2) Standardisierung
+    X2 = apply_standardization(X1, mean=mean, std=std)
+    # 3) Optional clip
+    X3 = clip_values(X2, clip=clip)
+    return X3
+
+
+def describe_stats(name: str, X: np.ndarray) -> None:
+    # Kurzer, hilfreicher Report (Deutsch)
+    flat = X.reshape(-1, X.shape[2]).astype(np.float32, copy=False)
+    ch_mean = flat.mean(axis=0)
+    ch_std = flat.std(axis=0)
+    print(f"{name}: Shape={X.shape}")
+    for i, col in enumerate(SENSOR_COLS_STD):
+        print(f"  {col:6s}  mean={ch_mean[i]: .4f}  std={ch_std[i]: .4f}")
+
+
+def main(in_dir: str, out_dir: str, eps: float, clip: float) -> None:
+    train_path = os.path.join(in_dir, "train_raw.npz")
+    val_path   = os.path.join(in_dir, "val_raw.npz")
+    test_path  = os.path.join(in_dir, "test_raw.npz")
+
+    X_train_raw, y_train = load_npz(train_path)
+    X_val_raw, y_val     = load_npz(val_path)
+    X_test_raw, y_test   = load_npz(test_path)
+
+    # Offset Removal zuerst auf Train, damit Norm-Parameter zu genau dem passen,
+    # was später auch für Val/Test gemacht wird.
+    X_train_off = offset_remove_per_window(X_train_raw)
+    params = compute_train_norm_params(X_train_off, eps=eps)
+
+    mean = params["mean"]
+    std = params["std"]
+
+    X_train = apply_standardization(X_train_off, mean, std)
+    X_train = clip_values(X_train, clip)
+
+    X_val  = process_split(X_val_raw, mean, std, clip)
+    X_test = process_split(X_test_raw, mean, std, clip)
+
+    # Speichern
+    os.makedirs(out_dir, exist_ok=True)
+    save_npz(os.path.join(out_dir, "train_norm.npz"), X_train, y_train)
+    save_npz(os.path.join(out_dir, "val_norm.npz"), X_val, y_val)
+    save_npz(os.path.join(out_dir, "test_norm.npz"), X_test, y_test)
+
+    # Norm-Parameter für spätere Schritte (auch für C/ATOMS3 Implementierung)
+    meta = {
+        "preprocess": {
+            "offset_removal": "per_window_mean_subtraction",
+            "normalization": "channelwise_standardization",
+            "channels": SENSOR_COLS_STD,
+            "eps": float(eps),
+            "clip": float(clip) if clip is not None else 0.0,
+        },
+        "train_mean": mean.astype(float).tolist(),
+        "train_std": std.astype(float).tolist(),
+        "note": "Val/Test sind mit Train-Parametern normalisiert (kein Leakage).",
+    }
+
+    with open(os.path.join(out_dir, "norm_params.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # Report
+    print("Step 2 abgeschlossen: Offset Removal & Normalisierung")
+    print(f"Input:  {in_dir}")
+    print(f"Output: {out_dir}")
+    print("Train-Normparameter (aus Train nach Offset Removal):")
+    for i, col in enumerate(SENSOR_COLS_STD):
+        print(f"  {col:6s}  mean={mean[i]: .6f}  std={std[i]: .6f}")
+    print()
+
+    describe_stats("Train (normalisiert)", X_train)
+    describe_stats("Val   (normalisiert)", X_val)
+    describe_stats("Test  (normalisiert)", X_test)
+
+    print("\nOutputs:")
+    print("  train_norm.npz, val_norm.npz, test_norm.npz, norm_params.json")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Step 2: Offset Removal & Normalisierung")
+    p.add_argument("--in_dir", type=str, default="./artifacts_step1", help="Ordner mit train_raw.npz usw.")
+    p.add_argument("--out_dir", type=str, default="./artifacts_step2", help="Output-Ordner")
+    p.add_argument("--eps", type=float, default=1e-6, help="Minimaler std-Schutzwert")
+    p.add_argument(
+        "--clip",
+        type=float,
+        default=5.0,
+        help="Optionales Clipping nach Normalisierung (z.B. 5.0). <=0 deaktiviert."
+    )
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(in_dir=args.in_dir, out_dir=args.out_dir, eps=args.eps, clip=args.clip)
