@@ -1,0 +1,386 @@
+# 07_quantize_and_make_c_header.py
+# ------------------------------------------------------------
+
+import os
+import json
+import numpy as np
+
+try:
+    import tensorflow as tf
+except ImportError:
+    raise SystemExit("TensorFlow fehlt. Installiere: pip install tensorflow")
+
+
+# =========================
+# EINSTELLUNGEN
+# =========================
+MODEL_PATH = r"./STEP_6/best_model.keras"
+META_STEP1 = r"./STEP_1/metadata.json"
+REP_NPZ = r"./STEP_3/npz/train_aug_x3.npz"
+VAL_NPZ = r"./STEP_3/npz/val_norm.npz"
+OUT_DIR = r"./STEP_7"
+
+FEATURE_MODE = "mag_jerk"   # "basic" / "mag" / "mag_jerk"
+
+NUM_REP = 600
+SEED = 123
+
+ARRAY_NAME = "g_model_int8"
+
+DO_SANITY_CHECK = True
+SANITY_MAX = 800
+
+
+# =========================
+# Custom Loss (falls nötig)
+# =========================
+@tf.keras.utils.register_keras_serializable()
+class SparseFocalLoss(tf.keras.losses.Loss):
+    def __init__(self, gamma=2.0, alpha=0.25, name="sparse_focal_loss"):
+        super().__init__(name=name)
+        self.gamma = float(gamma)
+        self.alpha = float(alpha)
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.int32)
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+
+        idx = tf.stack([tf.range(tf.shape(y_true)[0]), y_true], axis=1)
+        p_t = tf.gather_nd(y_pred, idx)
+
+        focal = tf.pow(1.0 - p_t, self.gamma)
+        loss = -self.alpha * focal * tf.math.log(p_t)
+        return tf.reduce_mean(loss)
+
+    def get_config(self):
+        return {"gamma": self.gamma, "alpha": self.alpha, "name": self.name}
+
+
+# =========================
+# IO
+# =========================
+def load_npz(path):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+    d = np.load(path)
+    if "X" not in d or "y" not in d:
+        raise ValueError(f"NPZ muss Keys X und y enthalten: {path}")
+    X = d["X"].astype(np.float32, copy=False)
+    y = d["y"].astype(np.int64, copy=False)
+    if X.ndim != 3:
+        raise ValueError(f"X muss [N,T,C] sein. Bekommen: {X.shape}")
+    if y.ndim != 1 or y.shape[0] != X.shape[0]:
+        raise ValueError(f"y muss [N] sein und zu X passen. X:{X.shape} y:{y.shape}")
+    return X, y
+
+
+def try_load_classnames(meta_path):
+    if not meta_path or not os.path.isfile(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        classes = meta.get("classes", None)
+        if isinstance(classes, list) and len(classes) > 0:
+            return [str(c) for c in classes]
+    except Exception:
+        return None
+    return None
+
+
+def write_bytes(path, blob):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(blob)
+
+
+# =========================
+# Features (wie Step 6)
+# =========================
+def add_magnitude_features(X):
+    if X.shape[2] != 6:
+        raise ValueError("Magnitude erwartet Input mit 6 Kanälen.")
+    ax, ay, az = X[..., 0], X[..., 1], X[..., 2]
+    gx, gy, gz = X[..., 3], X[..., 4], X[..., 5]
+    acc_mag = np.sqrt(np.maximum(ax * ax + ay * ay + az * az, 0.0)).astype(np.float32)[..., None]
+    gyr_mag = np.sqrt(np.maximum(gx * gx + gy * gy + gz * gz, 0.0)).astype(np.float32)[..., None]
+    return np.concatenate([X, acc_mag, gyr_mag], axis=2).astype(np.float32, copy=False)
+
+
+def add_jerk_magnitude_features(X):
+    X8 = add_magnitude_features(X)
+    d = np.diff(X[:, :, :6], axis=1, prepend=X[:, 0:1, :6]).astype(np.float32)
+
+    dax, day, daz = d[..., 0], d[..., 1], d[..., 2]
+    dgx, dgy, dgz = d[..., 3], d[..., 4], d[..., 5]
+
+    acc_jerk = np.sqrt(np.maximum(dax * dax + day * day + daz * daz, 0.0)).astype(np.float32)[..., None]
+    gyr_jerk = np.sqrt(np.maximum(dgx * dgx + dgy * dgy + dgz * dgz, 0.0)).astype(np.float32)[..., None]
+    return np.concatenate([X8, acc_jerk, gyr_jerk], axis=2).astype(np.float32, copy=False)
+
+
+def build_features(X, mode):
+    if mode == "basic":
+        return X.astype(np.float32, copy=False)
+    if mode == "mag":
+        return add_magnitude_features(X)
+    if mode == "mag_jerk":
+        return add_jerk_magnitude_features(X)
+    raise ValueError("FEATURE_MODE muss 'basic', 'mag' oder 'mag_jerk' sein.")
+
+
+# =========================
+# Representative Generator
+# =========================
+def representative_data_gen(X_rep, num_samples, seed):
+    rng = np.random.default_rng(seed)
+    n = X_rep.shape[0]
+    m = min(int(num_samples), int(n))
+    idx = rng.choice(n, size=m, replace=False)
+    for i in idx:
+        yield [X_rep[i:i+1].astype(np.float32, copy=False)]
+
+
+# =========================
+# Quantisierung
+# =========================
+def convert_to_full_int8(model, X_rep, num_rep, seed):
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = lambda: representative_data_gen(X_rep, num_samples=num_rep, seed=seed)
+
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+
+    return converter.convert()
+
+
+def extract_quant_params(tflite_path):
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+
+    in_det = interpreter.get_input_details()[0]
+    out_det = interpreter.get_output_details()[0]
+
+    return {
+        "input": {
+            "name": in_det.get("name", ""),
+            "shape": [int(x) for x in in_det["shape"]],
+            "dtype": str(in_det["dtype"]),
+            "quantization": {
+                "scale": float(in_det["quantization"][0]),
+                "zero_point": int(in_det["quantization"][1]),
+            },
+        },
+        "output": {
+            "name": out_det.get("name", ""),
+            "shape": [int(x) for x in out_det["shape"]],
+            "dtype": str(out_det["dtype"]),
+            "quantization": {
+                "scale": float(out_det["quantization"][0]),
+                "zero_point": int(out_det["quantization"][1]),
+            },
+        },
+    }
+
+
+# =========================
+# C Header Export
+# =========================
+def make_c_array_header(tflite_path, out_h, array_name):
+    with open(tflite_path, "rb") as f:
+        blob = f.read()
+
+    os.makedirs(os.path.dirname(out_h), exist_ok=True)
+
+    hex_bytes = [f"0x{b:02x}" for b in blob]
+    lines = []
+    for i in range(0, len(hex_bytes), 12):
+        lines.append(", ".join(hex_bytes[i:i+12]))
+
+    with open(out_h, "w", encoding="utf-8") as f:
+        f.write("#pragma once\n")
+        f.write("#include <cstdint>\n")
+        f.write("#include <cstddef>\n\n")
+        f.write("// TFLite Micro Modell (FULL INT8)\n")
+        f.write(f"alignas(16) const unsigned char {array_name}[] = {{\n")
+        for line in lines:
+            f.write(f"  {line},\n")
+        f.write("};\n\n")
+        f.write(f"const size_t {array_name}_len = {len(blob)};\n")
+
+
+def write_metadata_header(out_path, qp, class_names, feature_mode):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    in_shape = qp["input"]["shape"]
+    out_shape = qp["output"]["shape"]
+
+    T = int(in_shape[1]) if len(in_shape) >= 3 else 0
+    C = int(in_shape[2]) if len(in_shape) >= 3 else 0
+    K = int(out_shape[1]) if len(out_shape) >= 2 else 0
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("#pragma once\n")
+        f.write("#include <cstdint>\n\n")
+        f.write("// Metadaten: Shapes + Quantisierung\n\n")
+
+        f.write(f"#define MODEL_INPUT_T {T}\n")
+        f.write(f"#define MODEL_INPUT_C {C}\n")
+        f.write(f"#define MODEL_NUM_CLASSES {K}\n\n")
+
+        f.write(f"#define MODEL_INPUT_SCALE ({qp['input']['quantization']['scale']:.10f}f)\n")
+        f.write(f"#define MODEL_INPUT_ZERO_POINT ({qp['input']['quantization']['zero_point']})\n")
+        f.write(f"#define MODEL_OUTPUT_SCALE ({qp['output']['quantization']['scale']:.10f}f)\n")
+        f.write(f"#define MODEL_OUTPUT_ZERO_POINT ({qp['output']['quantization']['zero_point']})\n\n")
+
+        f.write("// Feature Mode\n")
+        if feature_mode == "basic":
+            f.write("#define FEATURE_MODE_BASIC 1\n")
+        elif feature_mode == "mag":
+            f.write("#define FEATURE_MODE_MAG 1\n")
+        elif feature_mode == "mag_jerk":
+            f.write("#define FEATURE_MODE_MAG_JERK 1\n")
+        f.write("\n")
+
+        if class_names and len(class_names) == K:
+            f.write("static const char* const MODEL_CLASS_NAMES[MODEL_NUM_CLASSES] = {\n")
+            for name in class_names:
+                safe = name.replace("\\", "\\\\").replace("\"", "\\\"")
+                f.write(f"  \"{safe}\",\n")
+            f.write("};\n")
+
+
+# =========================
+# Sanity Check
+# =========================
+def run_sanity_check(keras_model, tflite_path, X_val, y_val, max_eval=800):
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+    in_det = interpreter.get_input_details()[0]
+    out_det = interpreter.get_output_details()[0]
+
+    in_scale, in_zp = in_det["quantization"]
+    out_scale, out_zp = out_det["quantization"]
+
+    n = min(int(max_eval), int(X_val.shape[0]))
+    Xv = X_val[:n].astype(np.float32, copy=False)
+    yv = y_val[:n].astype(np.int64, copy=False)
+
+    p_float = keras_model.predict(Xv, batch_size=256, verbose=0)
+    y_float = np.argmax(p_float, axis=1).astype(np.int64)
+
+    y_int8 = np.zeros((n,), dtype=np.int64)
+
+    for i in range(n):
+        x = Xv[i:i+1]
+        q = np.round(x / in_scale + in_zp).astype(np.int32)
+        q = np.clip(q, -128, 127).astype(np.int8)
+
+        interpreter.set_tensor(in_det["index"], q)
+        interpreter.invoke()
+
+        out_q = interpreter.get_tensor(out_det["index"])  # int8
+        out_f = (out_q.astype(np.int32) - int(out_zp)) * float(out_scale)
+        y_int8[i] = int(np.argmax(out_f, axis=1)[0])
+
+    return {
+        "val_samples_checked": int(n),
+        "val_accuracy_int8": float(np.mean(y_int8 == yv)),
+        "float_vs_int8_top1_agreement": float(np.mean(y_int8 == y_float)),
+    }
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("Step 7: Quantisierung + C Header")
+    print("MODEL_PATH:", os.path.abspath(MODEL_PATH))
+    print("REP_NPZ   :", os.path.abspath(REP_NPZ))
+    print("OUT_DIR   :", os.path.abspath(OUT_DIR))
+    print("FEATURE_MODE:", FEATURE_MODE)
+
+    if not os.path.isfile(MODEL_PATH):
+        raise FileNotFoundError(f"Model nicht gefunden: {MODEL_PATH}")
+
+    # WICHTIG: compile=False -> keine Probleme mit SparseFocalLoss
+    model = tf.keras.models.load_model(
+        MODEL_PATH,
+        compile=False,
+        custom_objects={"SparseFocalLoss": SparseFocalLoss}
+    )
+
+    X_rep, _ = load_npz(REP_NPZ)
+    X_rep = build_features(X_rep, FEATURE_MODE)
+
+    # Shape Check
+    if len(model.input_shape) == 3:
+        Tm, Cm = int(model.input_shape[1]), int(model.input_shape[2])
+        if X_rep.shape[1] != Tm or X_rep.shape[2] != Cm:
+            raise RuntimeError(
+                f"Shape passt nicht!\n"
+                f"Model erwartet: T={Tm}, C={Cm}\n"
+                f"Rep Daten haben: T={X_rep.shape[1]}, C={X_rep.shape[2]}\n"
+                f"Prüfe FEATURE_MODE und Rep NPZ."
+            )
+
+    print("Representative Shape:", X_rep.shape)
+
+    print("Konvertiere zu FULL INT8 ...")
+    tflite_blob = convert_to_full_int8(model, X_rep, NUM_REP, SEED)
+
+    tflite_path = os.path.join(OUT_DIR, "model_int8.tflite")
+    write_bytes(tflite_path, tflite_blob)
+
+    size_kb = os.path.getsize(tflite_path) / 1024.0
+    print(f"Gespeichert: {tflite_path} ({size_kb:.1f} KB)")
+
+    qp = extract_quant_params(tflite_path)
+
+    model_h = os.path.join(OUT_DIR, "model_int8.h")
+    make_c_array_header(tflite_path, model_h, ARRAY_NAME)
+
+    class_names = try_load_classnames(META_STEP1)
+    meta_h = os.path.join(OUT_DIR, "model_metadata.h")
+    write_metadata_header(meta_h, qp, class_names, FEATURE_MODE)
+
+    sanity = None
+    if DO_SANITY_CHECK and os.path.isfile(VAL_NPZ):
+        X_val, y_val = load_npz(VAL_NPZ)
+        X_val = build_features(X_val, FEATURE_MODE)
+        print("Sanity Check (float vs int8) ...")
+        sanity = run_sanity_check(model, tflite_path, X_val, y_val, max_eval=SANITY_MAX)
+        print("  Val Accuracy (int8):", sanity["val_accuracy_int8"])
+        print("  Agreement float/int8:", sanity["float_vs_int8_top1_agreement"])
+
+    summary = {
+        "model_path": MODEL_PATH,
+        "rep_npz": REP_NPZ,
+        "feature_mode": FEATURE_MODE,
+        "num_rep": int(NUM_REP),
+        "seed": int(SEED),
+        "tflite_size_kb": float(size_kb),
+        "quant_params": qp,
+        "headers": {
+            "model_header": "model_int8.h",
+            "metadata_header": "model_metadata.h",
+            "array_name": ARRAY_NAME,
+        },
+        "sanity": sanity,
+    }
+
+    with open(os.path.join(OUT_DIR, "step7_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print("\nFERTIG  Step 7")
+    print("Quant Input :", qp["input"]["quantization"])
+    print("Quant Output:", qp["output"]["quantization"])
+    print("Outputs: model_int8.tflite, model_int8.h, model_metadata.h, step7_summary.json")
+
+
+if __name__ == "__main__":
+    main()
