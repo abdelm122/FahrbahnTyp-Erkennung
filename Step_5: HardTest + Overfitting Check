@@ -1,6 +1,5 @@
 # 05_hard_test_overfitting_check.py
 # ------------------------------------------------------------
-# Step 5: Hard Test & Overfitting Check (anfängerfreundlich + robust)
 #
 # Inputs:
 #   STEP_4/best_model.keras
