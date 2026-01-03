@@ -1,223 +1,209 @@
-# 03_data_augmentation_x3.py
+# 03_data_augmentation_x3_simple.py
 # ------------------------------------------------------------
-# Step 3: Data Augmentation x3
-#
 # Input:
-#   artifacts_step2/train_norm.npz   (X: [N,T,6], y:[N])
-#   artifacts_step2/val_norm.npz     (nur kopiert, keine Augmentation)
-#   artifacts_step2/test_norm.npz    (nur kopiert, keine Augmentation)
+#   STEP_2/npz/train_norm.npz   (X: [N,T,6], y:[N])
+#   STEP_2/npz/val_norm.npz
+#   STEP_2/npz/test_norm.npz
 #
 # Output:
-#   artifacts_step3/train_aug_x3.npz (X: [3N,T,6], y:[3N])
-#   artifacts_step3/val_norm.npz
-#   artifacts_step3/test_norm.npz
-#   artifacts_step3/aug_config.json
-#
-# Hinweis:
-# - Diese Augmentation ist bewusst "leicht" gehalten, um Realismus zu bewahren.
-# - Werte sind nach Step 2 normalisiert; daher sind Skalen typischerweise nahe 1.
+#   STEP_3/npz/train_aug_x3.npz (X: [3N,T,6], y:[3N])
+#   STEP_3/npz/val_norm.npz     (nur kopiert)
+#   STEP_3/npz/test_norm.npz    (nur kopiert)
+#   STEP_3/aug_config.json
 # ------------------------------------------------------------
 
-import argparse
-import json
 import os
-from typing import Tuple, Dict
-
+import json
 import numpy as np
 
+# =========================
+# EINSTELLUNGEN
+# =========================
+IN_DIR = r"./STEP_2/npz"
+OUT_DIR = r"./STEP_3"
 
-SENSOR_COLS_STD = ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"]
+SEED = 123
+FACTOR = 3  # 3 = Original + 2 Aug-Kopien
+
+# Augmentation-Stärken (moderate Werte)
+JITTER_SIGMA = 0.03         # Rauschen
+SCALING_SIGMA = 0.05        # Gain pro Kanal
+P_MASK = 0.7                # Wahrscheinlichkeit für Time-Mask
+AXIS_MIX_P = 0.3            # Wahrscheinlichkeit für Axis-Mix
+AXIS_MIX_STRENGTH = 0.02    # Stärke für Axis-Mix
 
 
-def load_npz(path: str) -> Tuple[np.ndarray, np.ndarray]:
+# =========================
+# I/O
+# =========================
+def load_npz(path):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Datei nicht gefunden: {path}")
     d = np.load(path)
-    X, y = d["X"], d["y"]
+    if "X" not in d or "y" not in d:
+        raise ValueError(f"NPZ braucht Keys X und y: {path}")
+    X = d["X"].astype(np.float32, copy=False)
+    y = d["y"].astype(np.int64, copy=False)
+
     if X.ndim != 3 or X.shape[2] != 6:
         raise ValueError(f"X muss [N,T,6] sein. Bekommen: {X.shape}")
     if y.ndim != 1 or y.shape[0] != X.shape[0]:
         raise ValueError(f"y muss [N] sein und zu X passen. X:{X.shape} y:{y.shape}")
-    return X.astype(np.float32, copy=False), y.astype(np.int64, copy=False)
+
+    return X, y
 
 
-def save_npz(path: str, X: np.ndarray, y: np.ndarray) -> None:
+def save_npz(path, X, y):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     np.savez_compressed(path, X=X.astype(np.float32, copy=False), y=y.astype(np.int64, copy=False))
 
 
-# ----------------------- Augmentation Bausteine -----------------------
+# =========================
+# AUGMENTATION (einfach)
+# =========================
+def aug_jitter(X, rng, sigma):
+    noise = rng.normal(0.0, sigma, size=X.shape).astype(np.float32)
+    return X + noise
 
-def aug_jitter(X: np.ndarray, rng: np.random.Generator, sigma: float) -> np.ndarray:
-    # add N(0, sigma) noise
-    noise = rng.normal(loc=0.0, scale=sigma, size=X.shape).astype(np.float32)
-    return (X + noise).astype(np.float32, copy=False)
 
-
-def aug_scaling(X: np.ndarray, rng: np.random.Generator, scale_sigma: float) -> np.ndarray:
-    # multiply each channel by (1 + N(0, scale_sigma))
+def aug_scaling(X, rng, scale_sigma):
     gains = (1.0 + rng.normal(0.0, scale_sigma, size=(1, 1, X.shape[2]))).astype(np.float32)
-    return (X * gains).astype(np.float32, copy=False)
+    return X * gains
 
 
-def aug_time_shift(X: np.ndarray, rng: np.random.Generator, max_shift: int) -> np.ndarray:
-    # circular roll along time axis
+def aug_time_shift(X, rng, max_shift):
     if max_shift <= 0:
         return X
     shift = int(rng.integers(-max_shift, max_shift + 1))
-    if shift == 0:
-        return X
-    return np.roll(X, shift=shift, axis=1).astype(np.float32, copy=False)
+    return np.roll(X, shift=shift, axis=1)
 
 
-def aug_time_mask(X: np.ndarray, rng: np.random.Generator, max_mask_len: int) -> np.ndarray:
-    # set a short contiguous segment to zero
+def aug_time_mask(X, rng, max_mask_len):
     if max_mask_len <= 0:
         return X
     T = X.shape[1]
     mask_len = int(rng.integers(0, max_mask_len + 1))
     if mask_len <= 0 or mask_len >= T:
         return X
+
     start = int(rng.integers(0, T - mask_len))
     X2 = X.copy()
     X2[:, start:start + mask_len, :] = 0.0
-    return X2.astype(np.float32, copy=False)
+    return X2
 
 
-def aug_axis_mix(X: np.ndarray, rng: np.random.Generator, mix_strength: float) -> np.ndarray:
-    """
-    Simuliert leichte Achsrotation/Fehlmontage:
-    X_new = X * M, wobei M nahe an Identität ist.
-    mix_strength klein halten (z.B. 0.02), sonst wird es unphysikalisch.
-    """
-    if mix_strength <= 0:
+def aug_axis_mix(X, rng, strength):
+    # leichte Mischung der 6 Kanäle (klein halten!)
+    if strength <= 0:
         return X
 
     C = X.shape[2]
     M = np.eye(C, dtype=np.float32)
 
-    # Nur kleine Off-Diagonal Werte
-    # Wir mischen zufällig ein paar Paare leicht
-    num_pairs = min(6, C * 2)
-    for _ in range(num_pairs):
+    # ein paar Off-diagonal Werte
+    for _ in range(8):
         i = int(rng.integers(0, C))
         j = int(rng.integers(0, C))
         if i != j:
-            M[i, j] += float(rng.normal(0.0, mix_strength))
+            M[i, j] += float(rng.normal(0.0, strength))
 
-    # Normiere Zeilen leicht, damit nicht explodiert
+    # stabilisieren
     row_norms = np.linalg.norm(M, axis=1, keepdims=True)
     M = M / np.maximum(row_norms, 1e-6)
 
-    # Apply: [N,T,C] @ [C,C] -> [N,T,C]
-    return np.einsum("ntc,cd->ntd", X, M).astype(np.float32, copy=False)
+    return np.einsum("ntc,cd->ntd", X, M).astype(np.float32)
 
 
-def augment_one_batch(
-    X: np.ndarray,
-    rng: np.random.Generator,
-    cfg: Dict
-) -> np.ndarray:
-    """
-    Wendet eine Kette von Augmentations an.
-    cfg steuert Intensitäten.
-    """
+def augment_batch(X, rng):
+    # moderate defaults passend zu normalisierten Daten
+    T = X.shape[1]
+    max_shift = max(1, T // 20)      # ca. 5%
+    max_mask_len = max(1, T // 25)   # kurzer dropout
+
     X2 = X
-    if cfg["p_jitter"] > 0 and rng.random() < cfg["p_jitter"]:
-        X2 = aug_jitter(X2, rng, sigma=cfg["jitter_sigma"])
+    X2 = aug_jitter(X2, rng, JITTER_SIGMA)
+    X2 = aug_scaling(X2, rng, SCALING_SIGMA)
+    X2 = aug_time_shift(X2, rng, max_shift)
 
-    if cfg["p_scaling"] > 0 and rng.random() < cfg["p_scaling"]:
-        X2 = aug_scaling(X2, rng, scale_sigma=cfg["scaling_sigma"])
+    if rng.random() < P_MASK:
+        X2 = aug_time_mask(X2, rng, max_mask_len)
 
-    if cfg["p_shift"] > 0 and rng.random() < cfg["p_shift"]:
-        X2 = aug_time_shift(X2, rng, max_shift=cfg["max_shift"])
+    if rng.random() < AXIS_MIX_P:
+        X2 = aug_axis_mix(X2, rng, AXIS_MIX_STRENGTH)
 
-    if cfg["p_mask"] > 0 and rng.random() < cfg["p_mask"]:
-        X2 = aug_time_mask(X2, rng, max_mask_len=cfg["max_mask_len"])
-
-    if cfg["p_axis_mix"] > 0 and rng.random() < cfg["p_axis_mix"]:
-        X2 = aug_axis_mix(X2, rng, mix_strength=cfg["axis_mix_strength"])
-
-    return X2
+    return X2.astype(np.float32)
 
 
-# ----------------------- Main -----------------------
+# =========================
+# MAIN
+# =========================
+def main():
+    print("Starte Step 3: Data Augmentation x3")
+    print("IN_DIR :", os.path.abspath(IN_DIR))
+    print("OUT_DIR:", os.path.abspath(OUT_DIR))
 
-def main(in_dir: str, out_dir: str, seed: int) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-
-    train_path = os.path.join(in_dir, "train_norm.npz")
-    val_path   = os.path.join(in_dir, "val_norm.npz")
-    test_path  = os.path.join(in_dir, "test_norm.npz")
+    train_path = os.path.join(IN_DIR, "train_norm.npz")
+    val_path = os.path.join(IN_DIR, "val_norm.npz")
+    test_path = os.path.join(IN_DIR, "test_norm.npz")
 
     X_train, y_train = load_npz(train_path)
-    X_val, y_val     = load_npz(val_path)
-    X_test, y_test   = load_npz(test_path)
+    X_val, y_val = load_npz(val_path)
+    X_test, y_test = load_npz(test_path)
 
-    rng = np.random.default_rng(seed)
+    print("\nGeladen:")
+    print("  Train:", X_train.shape, y_train.shape)
+    print("  Val  :", X_val.shape, y_val.shape)
+    print("  Test :", X_test.shape, y_test.shape)
 
-    # Aug-Config: bewusst moderat
-    # Normalisierte Daten: std etwa 1 pro Kanal
-    cfg = {
-        "factor": 3,
+    rng = np.random.default_rng(SEED)
 
-        "p_jitter": 1.0,
-        "jitter_sigma": 0.03,     # klein
-
-        "p_scaling": 1.0,
-        "scaling_sigma": 0.05,    # Gain ~ 1 +/- 0.05
-
-        "p_shift": 1.0,
-        "max_shift": max(1, X_train.shape[1] // 20),  # ~5% der Fensterlänge
-
-        "p_mask": 0.7,
-        "max_mask_len": max(1, X_train.shape[1] // 25),  # kurzer Dropout
-
-        "p_axis_mix": 0.3,
-        "axis_mix_strength": 0.02,
-    }
-
-    N = X_train.shape[0]
-    # Original
+    # Wir bauen: Original + 2 Augmentierungen
     X0 = X_train
     y0 = y_train
 
-    # Zwei augmentierte Kopien
-    X1 = augment_one_batch(X_train, rng, cfg)
-    X2 = augment_one_batch(X_train, rng, cfg)
+    X1 = augment_batch(X_train, rng)
+    X2 = augment_batch(X_train, rng)
 
-    X_aug = np.concatenate([X0, X1, X2], axis=0).astype(np.float32, copy=False)
-    y_aug = np.concatenate([y0, y0, y0], axis=0).astype(np.int64, copy=False)
+    X_aug = np.concatenate([X0, X1, X2], axis=0).astype(np.float32)
+    y_aug = np.concatenate([y0, y0, y0], axis=0).astype(np.int64)
 
-    # Shuffle, damit nicht Blockweise sortiert ist
+    # Shuffle
     idx = rng.permutation(X_aug.shape[0])
     X_aug = X_aug[idx]
     y_aug = y_aug[idx]
 
-    save_npz(os.path.join(out_dir, "train_aug_x3.npz"), X_aug, y_aug)
-    save_npz(os.path.join(out_dir, "val_norm.npz"), X_val, y_val)
-    save_npz(os.path.join(out_dir, "test_norm.npz"), X_test, y_test)
+    # Output
+    out_npz = os.path.join(OUT_DIR, "npz")
+    os.makedirs(out_npz, exist_ok=True)
 
-    with open(os.path.join(out_dir, "aug_config.json"), "w", encoding="utf-8") as f:
+    save_npz(os.path.join(out_npz, "train_aug_x3.npz"), X_aug, y_aug)
+    save_npz(os.path.join(out_npz, "val_norm.npz"), X_val, y_val)
+    save_npz(os.path.join(out_npz, "test_norm.npz"), X_test, y_test)
+
+    cfg = {
+        "factor": FACTOR,
+        "seed": SEED,
+        "jitter_sigma": JITTER_SIGMA,
+        "scaling_sigma": SCALING_SIGMA,
+        "p_mask": P_MASK,
+        "axis_mix_p": AXIS_MIX_P,
+        "axis_mix_strength": AXIS_MIX_STRENGTH,
+        "note": "Val/Test unverändert. Train = Original + 2 augmentierte Kopien."
+    }
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(os.path.join(OUT_DIR, "aug_config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-    # Report (Deutsch)
-    print("Step 3 abgeschlossen: Data Augmentation x3")
-    print(f"Input:  {in_dir}")
-    print(f"Output: {out_dir}")
-    print(f"Train vorher: N={N} | Train nachher: N={X_aug.shape[0]} (Faktor {cfg['factor']})")
-    print("Val/Test unverändert (keine Augmentation).")
-    print("Outputs: train_aug_x3.npz, val_norm.npz, test_norm.npz, aug_config.json")
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Step 3: Data Augmentation x3")
-    p.add_argument("--in_dir", type=str, default="./artifacts_step2", help="Ordner mit train_norm.npz usw.")
-    p.add_argument("--out_dir", type=str, default="./artifacts_step3", help="Output-Ordner")
-    p.add_argument("--seed", type=int, default=123, help="Random Seed")
-    return p.parse_args()
+    print("\nFERTIG")
+    print("Train vorher:", X_train.shape[0], "Train nachher:", X_aug.shape[0])
+    print("Outputs:")
+    print(" ", os.path.join(out_npz, "train_aug_x3.npz"))
+    print(" ", os.path.join(out_npz, "val_norm.npz"))
+    print(" ", os.path.join(out_npz, "test_norm.npz"))
+    print(" ", os.path.join(OUT_DIR, "aug_config.json"))
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(in_dir=args.in_dir, out_dir=args.out_dir, seed=args.seed)
+    main()
+
