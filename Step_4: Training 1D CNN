@@ -1,110 +1,112 @@
-# 04_training_tiny_1dcnn.py
+# 04_training_tiny_1dcnn_simple.py
 # ------------------------------------------------------------
-# Step 4: Training Tiny 1D CNN
 #
-# Input (aus Step 3):
-#   artifacts_step3/train_aug_x3.npz  (X: [N,T,6], y:[N])
-#   artifacts_step3/val_norm.npz      (X: [N,T,6], y:[N])
+# Input:
+#   STEP_3/npz/train_aug_x3.npz  (X: [N,T,6], y:[N])
+#   STEP_3/npz/val_norm.npz      (X: [N,T,6], y:[N])
 #
 # Output:
-#   artifacts_step4/best_model.keras
-#   artifacts_step4/final_model.keras
-#   artifacts_step4/model_float.tflite
-#   artifacts_step4/train_history.json
-#   artifacts_step4/train_config.json
-#
-# Fokus:
-# - kleines Modell (wenige Parameter), quantisierungsfreundlich
-# - EarlyStopping + ModelCheckpoint
-# - Class Weights (optional hilfreich bei Imbalance)
-#
-# Installation:
-#   pip install tensorflow numpy
+#   STEP_4/best_model.keras
+#   STEP_4/final_model.keras
+#   STEP_4/model_float.tflite
+#   STEP_4/train_history.json
+#   STEP_4/train_config.json
 # ------------------------------------------------------------
 
-import argparse
-import json
 import os
-from typing import Tuple, Dict, Optional
-
+import json
 import numpy as np
 
-# TensorFlow ist hier bewusst gewählt, weil TFLite / TFLite Micro später Standard ist
-import tensorflow as tf
+# TensorFlow
+try:
+    import tensorflow as tf
+except ImportError:
+    raise SystemExit(
+        "TensorFlow fehlt. Installiere es z.B. mit:\n"
+        "pip install tensorflow"
+    )
+
+# =========================
+# EINSTELLUNGEN
+# =========================
+IN_DIR = r"./STEP_3/npz"
+OUT_DIR = r"./STEP_4"
+META_STEP1 = r"./STEP_1/metadata.json"   # optional für Klassen-Namen
+
+SEED = 42
+EPOCHS = 80
+BATCH_SIZE = 128
+LR = 1e-3
+USE_CLASS_WEIGHTS = False   # True, wenn du Imbalance hast
 
 
-SENSOR_COLS_STD = ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"]
+CHANNELS = ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"]
 
 
-def set_global_seed(seed: int) -> None:
+# =========================
+# HELFER
+# =========================
+def set_seed(seed):
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
 
-def load_npz(path: str) -> Tuple[np.ndarray, np.ndarray]:
+def load_npz(path):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+
     d = np.load(path)
     if "X" not in d or "y" not in d:
         raise ValueError(f"NPZ muss Keys X und y enthalten: {path}")
+
     X = d["X"].astype(np.float32, copy=False)
     y = d["y"].astype(np.int64, copy=False)
 
     if X.ndim != 3 or X.shape[2] != 6:
-        raise ValueError(f"X muss Shape [N, T, 6] haben. Bekommen: {X.shape} in {path}")
+        raise ValueError(f"X muss [N,T,6] sein. Bekommen: {X.shape} in {path}")
     if y.ndim != 1 or y.shape[0] != X.shape[0]:
-        raise ValueError(f"y muss Shape [N] haben und zu X passen. X:{X.shape} y:{y.shape} in {path}")
+        raise ValueError(f"y muss [N] sein und zu X passen. X:{X.shape} y:{y.shape} in {path}")
+
     return X, y
 
 
-def try_load_classnames(meta_path: str) -> Optional[Dict[int, str]]:
-    """
-    Optional: liest metadata.json aus Step 1, um Klassen-Namen sauber auszugeben.
-    """
+def try_load_classnames(meta_path):
     if not meta_path or not os.path.isfile(meta_path):
         return None
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        if "classes" in meta and isinstance(meta["classes"], list):
-            return {i: name for i, name in enumerate(meta["classes"])}
+        classes = meta.get("classes", None)
+        if isinstance(classes, list):
+            return {i: name for i, name in enumerate(classes)}
     except Exception:
         return None
     return None
 
 
-def compute_class_weights(y: np.ndarray, num_classes: int) -> Dict[int, float]:
-    """
-    Einfache inverse Häufigkeit (stabil, reicht in vielen Fällen).
-    """
+def compute_class_weights(y, num_classes):
     counts = np.bincount(y, minlength=num_classes).astype(np.float32)
     counts = np.maximum(counts, 1.0)
     inv = 1.0 / counts
-    weights = inv * (counts.sum() / (num_classes))
+    weights = inv * (counts.sum() / num_classes)
     return {i: float(weights[i]) for i in range(num_classes)}
 
 
-def build_tiny_1dcnn(input_shape: Tuple[int, int], num_classes: int) -> tf.keras.Model:
-    """
-    Tiny 1D CNN:
-    - wenig Filter
-    - GlobalAveragePooling statt großer Dense-Blöcke
-    - BatchNorm ist ok, wird oft beim TFLite Export gefused
-    """
-    inp = tf.keras.Input(shape=input_shape, name="imu_window")  # (T, 6)
+def build_tiny_1dcnn(T, C, num_classes):
+    inp = tf.keras.Input(shape=(T, C), name="imu_window")
 
-    x = tf.keras.layers.Conv1D(16, kernel_size=7, padding="same", use_bias=False)(inp)
+    x = tf.keras.layers.Conv1D(16, 7, padding="same", use_bias=False)(inp)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.ReLU()(x)
-    x = tf.keras.layers.MaxPool1D(pool_size=2)(x)
+    x = tf.keras.layers.MaxPool1D(2)(x)
 
-    x = tf.keras.layers.Conv1D(24, kernel_size=5, padding="same", use_bias=False)(x)
+    x = tf.keras.layers.Conv1D(24, 5, padding="same", use_bias=False)(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.ReLU()(x)
-    x = tf.keras.layers.MaxPool1D(pool_size=2)(x)
+    x = tf.keras.layers.MaxPool1D(2)(x)
 
-    x = tf.keras.layers.Conv1D(32, kernel_size=3, padding="same", use_bias=False)(x)
+    x = tf.keras.layers.Conv1D(32, 3, padding="same", use_bias=False)(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.ReLU()(x)
 
@@ -114,51 +116,62 @@ def build_tiny_1dcnn(input_shape: Tuple[int, int], num_classes: int) -> tf.keras
 
     out = tf.keras.layers.Dense(num_classes, activation="softmax", name="class_prob")(x)
 
-    model = tf.keras.Model(inputs=inp, outputs=out, name="tiny_1dcnn")
+    model = tf.keras.Model(inp, out, name="tiny_1dcnn")
     return model
 
 
-def export_float_tflite(model: tf.keras.Model, out_path: str) -> None:
+def export_float_tflite(model, out_path):
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    # bewusst kein Quant hier; kommt als eigener Step 7
     tflite_model = converter.convert()
     with open(out_path, "wb") as f:
         f.write(tflite_model)
 
 
-def train(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    out_dir: str,
-    class_id_to_name: Optional[Dict[int, str]],
-    seed: int,
-    epochs: int,
-    batch_size: int,
-    lr: float,
-    use_class_weights: bool
-) -> None:
-    os.makedirs(out_dir, exist_ok=True)
+# =========================
+# MAIN
+# =========================
+def main():
+    set_seed(SEED)
 
-    T = X_train.shape[1]
-    C = X_train.shape[2]
+    print("Starte Step 4: Training Tiny 1D CNN")
+    print("IN_DIR :", os.path.abspath(IN_DIR))
+    print("OUT_DIR:", os.path.abspath(OUT_DIR))
+    print("Settings: epochs =", EPOCHS, "| batch =", BATCH_SIZE, "| lr =", LR)
+
+    train_path = os.path.join(IN_DIR, "train_aug_x3.npz")
+    val_path = os.path.join(IN_DIR, "val_norm.npz")
+
+    X_train, y_train = load_npz(train_path)
+    X_val, y_val = load_npz(val_path)
+
+    print("\nDaten geladen:")
+    print("  Train:", X_train.shape, y_train.shape)
+    print("  Val  :", X_val.shape, y_val.shape)
+
+    T, C = X_train.shape[1], X_train.shape[2]
     num_classes = int(max(y_train.max(), y_val.max()) + 1)
 
-    model = build_tiny_1dcnn(input_shape=(T, C), num_classes=num_classes)
+    if X_val.shape[1] != T or X_val.shape[2] != C:
+        raise RuntimeError("Train und Val haben unterschiedliche Shapes. Prüfe Step 1/2/3.")
 
+    class_names = try_load_classnames(META_STEP1)
+
+    # Modell
+    model = build_tiny_1dcnn(T, C, num_classes)
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=LR),
         loss="sparse_categorical_crossentropy",
         metrics=[
             tf.keras.metrics.SparseCategoricalAccuracy(name="acc"),
-            tf.keras.metrics.SparseTopKCategoricalAccuracy(k=min(3, num_classes), name="top3_acc"),
         ],
     )
 
+    model.summary()
+
     # Callbacks
-    best_path = os.path.join(out_dir, "best_model.keras")
-    final_path = os.path.join(out_dir, "final_model.keras")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    best_path = os.path.join(OUT_DIR, "best_model.keras")
+    final_path = os.path.join(OUT_DIR, "final_model.keras")
 
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
@@ -166,7 +179,6 @@ def train(
             monitor="val_acc",
             mode="max",
             save_best_only=True,
-            save_weights_only=False,
             verbose=1,
         ),
         tf.keras.callbacks.EarlyStopping(
@@ -185,115 +197,85 @@ def train(
         ),
     ]
 
-    # Class weights (optional)
+    # Class weights optional
     class_weights = None
-    if use_class_weights:
-        class_weights = compute_class_weights(y_train, num_classes=num_classes)
+    if USE_CLASS_WEIGHTS:
+        class_weights = compute_class_weights(y_train, num_classes)
+        print("\nClass weights aktiv:")
+        for k, v in class_weights.items():
+            name = class_names.get(k, str(k)) if class_names else str(k)
+            print(f"  {k} ({name}) -> {v:.3f}")
 
-    # Train
+    # Training
     history = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
         shuffle=True,
         callbacks=callbacks,
         class_weight=class_weights,
         verbose=2
     )
 
-    # Speichern (final)
+    # Speichern final
     model.save(final_path)
 
-    # Export float TFLite von "best" (bzw. aktuellem) Modell
-    # Wenn EarlyStopping restored best weights, ist model effektiv "best"
-    tflite_path = os.path.join(out_dir, "model_float.tflite")
+    # TFLite export
+    tflite_path = os.path.join(OUT_DIR, "model_float.tflite")
     export_float_tflite(model, tflite_path)
 
-    # History / Config speichern
-    hist_path = os.path.join(out_dir, "train_history.json")
+    # History speichern
+    hist_path = os.path.join(OUT_DIR, "train_history.json")
     with open(hist_path, "w", encoding="utf-8") as f:
         json.dump(history.history, f, ensure_ascii=False, indent=2)
 
+    # Config speichern
     cfg = {
-        "seed": seed,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "learning_rate": lr,
-        "use_class_weights": bool(use_class_weights),
+        "seed": SEED,
+        "epochs": EPOCHS,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LR,
+        "use_class_weights": bool(USE_CLASS_WEIGHTS),
         "input_shape": [int(T), int(C)],
         "num_classes": int(num_classes),
-        "channels": SENSOR_COLS_STD,
-        "files": {
-            "best_model": "best_model.keras",
-            "final_model": "final_model.keras",
-            "tflite_float": "model_float.tflite",
-            "history": "train_history.json",
+        "channels": CHANNELS,
+        "paths": {
+            "train": train_path,
+            "val": val_path,
+            "best_model": best_path,
+            "final_model": final_path,
+            "tflite_float": tflite_path,
+            "history": hist_path,
         }
     }
-    with open(os.path.join(out_dir, "train_config.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(OUT_DIR, "train_config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-    # Kurzer Report (Deutsch)
-    print("\nStep 4 abgeschlossen: Training Tiny 1D CNN")
-    print(f"Train: {X_train.shape} | Val: {X_val.shape}")
-    print(f"Klassen: {num_classes}")
-    if class_id_to_name:
+    # Report
+    print("\nStep 4 fertig ✅")
+    print("Klassen:", num_classes)
+    if class_names:
         print("Klassen-Mapping:")
         for i in range(num_classes):
-            print(f"  {i}: {class_id_to_name.get(i, str(i))}")
+            print(f"  {i}: {class_names.get(i, str(i))}")
 
-    # Parameteranzahl (wichtig für ATOMS3)
-    trainable_params = int(np.sum([np.prod(v.shape) for v in model.trainable_variables]))
     total_params = model.count_params()
-    print(f"Parameter (trainable/total): {trainable_params} / {total_params}")
+    print("Total Params:", total_params)
 
-    # Best Val Accuracy aus history (falls vorhanden)
     if "val_acc" in history.history and len(history.history["val_acc"]) > 0:
         best_val = float(np.max(history.history["val_acc"]))
         last_val = float(history.history["val_acc"][-1])
-        print(f"Val-Accuracy: best={best_val:.4f} | last={last_val:.4f}")
+        print(f"Val acc: best={best_val:.4f} | last={last_val:.4f}")
 
-    print("Artefakte gespeichert in:", out_dir)
-    print("  best_model.keras, final_model.keras, model_float.tflite, train_history.json, train_config.json")
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Step 4: Training Tiny 1D CNN")
-    p.add_argument("--in_dir", type=str, default="./artifacts_step3", help="Ordner mit train_aug_x3.npz usw.")
-    p.add_argument("--out_dir", type=str, default="./artifacts_step4", help="Output-Ordner")
-    p.add_argument("--meta_step1", type=str, default="./artifacts_step1/metadata.json",
-                   help="Optional: metadata.json aus Step 1 (für Klassennamen).")
-    p.add_argument("--seed", type=int, default=42, help="Seed")
-    p.add_argument("--epochs", type=int, default=80, help="Max epochs (EarlyStopping stoppt oft früher)")
-    p.add_argument("--batch_size", type=int, default=128, help="Batch size")
-    p.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    p.add_argument("--class_weights", action="store_true", help="Aktiviert Class Weights bei Imbalance")
-    return p.parse_args()
+    print("\nOutputs in:", os.path.abspath(OUT_DIR))
+    print("  best_model.keras")
+    print("  final_model.keras")
+    print("  model_float.tflite")
+    print("  train_history.json")
+    print("  train_config.json")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    set_global_seed(args.seed)
+    main()
 
-    train_path = os.path.join(args.in_dir, "train_aug_x3.npz")
-    val_path   = os.path.join(args.in_dir, "val_norm.npz")
-
-    X_train, y_train = load_npz(train_path)
-    X_val, y_val     = load_npz(val_path)
-
-    class_id_to_name = try_load_classnames(args.meta_step1)
-
-    train(
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        out_dir=args.out_dir,
-        class_id_to_name=class_id_to_name,
-        seed=args.seed,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        use_class_weights=args.class_weights
-    )
