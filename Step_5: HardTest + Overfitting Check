@@ -1,542 +1,269 @@
-# 05_hard_test_overfitting_check.py
-# ------------------------------------------------------------
-#
-# Inputs:
-#   STEP_4/best_model.keras
-#   STEP_4/train_history.json
-#   STEP_3/npz/val_norm.npz
-#   STEP_3/npz/test_norm.npz
-#   STEP_1/metadata.json (optional für Klassennamen)
-#
-# Outputs:
-#   STEP_5/report_de.txt
-#   STEP_5/metrics.json
-#   STEP_5/confusion_matrix.csv
-#   STEP_5/hardtests.csv
-#   STEP_5/learning_curves_acc.png  (optional, wenn matplotlib installiert)
-#   STEP_5/learning_curves_loss.png (optional, wenn matplotlib installiert)
-#
-# Installation:
-#   pip install tensorflow numpy scikit-learn matplotlib
-# ------------------------------------------------------------
-
 import os
-import json
-import csv
 import numpy as np
+import pandas as pd
+import joblib
 
-# TensorFlow
-try:
-    import tensorflow as tf
-except ImportError:
-    raise SystemExit("TensorFlow fehlt. Installiere: pip install tensorflow")
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-# sklearn Metrics
-try:
-    from sklearn.metrics import (
-        accuracy_score,
-        confusion_matrix,
-        f1_score,
-        precision_recall_fscore_support,
-        classification_report,
-    )
-except ImportError:
-    raise SystemExit("scikit-learn fehlt. Installiere: pip install scikit-learn")
+# ============================================================
+# STEP 5: Hard Test + Overfitting Test (Decision Tree tuned)
+# - Window-Level Eval: Train vs Test
+# - File-Level Eval: Majority Vote (pro base_id)
+# - Leakage check
+# ============================================================
 
+# ===== Paths (anpassen) =====
+STEP3_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step3"
+STEP4_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step4_dt_tuned"
 
-# =========================
-# EINSTELLUNGEN (ANPASSEN WENN NÖTIG)
-# =========================
-STEP1_META = r"./STEP_1/metadata.json"
-STEP3_DIR = r"./STEP_3/npz"
-STEP4_DIR = r"./STEP_4"
-OUT_DIR = r"./STEP_5"
+MODEL_PATH = os.path.join(STEP4_DIR, "decision_tree_tuned.joblib")
+TRAIN_BASES_PATH = os.path.join(STEP4_DIR, "train_base_ids.csv")
+TEST_BASES_PATH = os.path.join(STEP4_DIR, "test_base_ids.csv")
 
-BATCH_SIZE = 256
-SEED_HARDTESTS = 202
+# ===== Base columns (wie in Code 4) =====
+BASE_COLS = ["AX(g)", "AY(g)", "AZ(g)", "GX(deg/s)", "GY(deg/s)", "GZ(deg/s)"]
 
+# ===== Windowing (muss gleich wie Training sein) =====
+WINDOW_SIZE = 256
+STRIDE = 128
 
-# =========================
-# I/O
-# =========================
-def load_npz(path):
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+# ===== Features (muss gleich wie Training sein) =====
+def features_1d(x):
+    x = np.asarray(x, dtype=float)
+    mean = np.mean(x)
+    std = np.std(x)              # ddof=0
+    mn = np.min(x)
+    mx = np.max(x)
+    rms = np.sqrt(np.mean(x * x))
+    med = np.median(x)
+    q25 = np.percentile(x, 25)
+    q75 = np.percentile(x, 75)
+    iqr = q75 - q25
+    energy = np.mean(x * x)
+    return [mean, std, mn, mx, rms, med, iqr, energy]
 
-    d = np.load(path)
-    if "X" not in d or "y" not in d:
-        raise ValueError(f"NPZ muss X und y enthalten: {path}")
+feat_names_1d = ["mean", "std", "min", "max", "rms", "median", "iqr", "energy"]
 
-    X = d["X"].astype(np.float32, copy=False)
-    y = d["y"].astype(np.int64, copy=False)
+def get_base_id(filename):
+    name = filename.replace(".csv", "")
+    return name.split("__")[0]
 
-    if X.ndim != 3 or X.shape[2] != 6:
-        raise ValueError(f"X muss [N,T,6] sein. Bekommen: {X.shape} in {path}")
-    if y.ndim != 1 or y.shape[0] != X.shape[0]:
-        raise ValueError(f"y muss [N] sein und zu X passen. X:{X.shape} y:{y.shape} in {path}")
+def build_channels(df):
+    AX = df["AX(g)"].astype(float).to_numpy()
+    AY = df["AY(g)"].astype(float).to_numpy()
+    AZ = df["AZ(g)"].astype(float).to_numpy()
+    GX = df["GX(deg/s)"].astype(float).to_numpy()
+    GY = df["GY(deg/s)"].astype(float).to_numpy()
+    GZ = df["GZ(deg/s)"].astype(float).to_numpy()
 
-    return X, y
+    acc_mag = np.sqrt(AX*AX + AY*AY + AZ*AZ)
+    gyro_mag = np.sqrt(GX*GX + GY*GY + GZ*GZ)
 
-
-def load_history(path):
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"train_history.json nicht gefunden: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def try_load_classnames(meta_path):
-    if not meta_path or not os.path.isfile(meta_path):
-        return None
-    try:
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        classes = meta.get("classes", None)
-        if isinstance(classes, list) and len(classes) > 0:
-            return [str(x) for x in classes]
-    except Exception:
-        return None
-    return None
-
-
-def write_text(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
-def write_confusion_csv(path, cm, class_names_used):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([""] + list(class_names_used))
-        for i, row in enumerate(cm):
-            w.writerow([class_names_used[i]] + [int(x) for x in row])
-
-
-def write_rows_csv(path, rows, fieldnames):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-
-# =========================
-# OVERFITTING AUS HISTORY
-# =========================
-def summarize_overfitting(history):
-    # Erwartet keys: acc, val_acc, loss, val_loss (wie in unserem Step 4)
-    # Falls andere Keys: versucht Fallback auf "*accuracy"
-    if "acc" not in history or "val_acc" not in history:
-        acc_key = None
-        val_acc_key = None
-        for k in history.keys():
-            if k.endswith("accuracy") and not k.startswith("val_"):
-                acc_key = k
-            if k.startswith("val_") and k.endswith("accuracy"):
-                val_acc_key = k
-        if acc_key and val_acc_key:
-            history = dict(history)
-            history["acc"] = history[acc_key]
-            history["val_acc"] = history[val_acc_key]
-        else:
-            raise ValueError("Konnte acc/val_acc in train_history.json nicht finden.")
-
-    acc = np.array(history["acc"], dtype=np.float32)
-    val_acc = np.array(history["val_acc"], dtype=np.float32)
-
-    best_epoch = int(np.argmax(val_acc))
-    best_val = float(val_acc[best_epoch])
-    train_at_best = float(acc[best_epoch]) if best_epoch < len(acc) else float(acc[-1])
-
-    out = {
-        "best_epoch_1based": int(best_epoch + 1),
-        "best_val_acc": best_val,
-        "train_acc_at_best": train_at_best,
-        "acc_gap_at_best": float(train_at_best - best_val),
+    chans = {
+        "AX": AX, "AY": AY, "AZ": AZ,
+        "GX": GX, "GY": GY, "GZ": GZ,
+        "acc_mag": acc_mag,
+        "gyro_mag": gyro_mag
     }
 
-    if "loss" in history and "val_loss" in history:
-        loss = np.array(history["loss"], dtype=np.float32)
-        val_loss = np.array(history["val_loss"], dtype=np.float32)
-        if best_epoch < len(loss) and best_epoch < len(val_loss):
-            out.update({
-                "train_loss_at_best": float(loss[best_epoch]),
-                "val_loss_at_best": float(val_loss[best_epoch]),
-                "loss_gap_at_best": float(val_loss[best_epoch] - loss[best_epoch]),
-            })
+    # jerk
+    for k in list(chans.keys()):
+        x = chans[k]
+        chans[k + "_jerk"] = np.diff(x, prepend=x[0])
 
-    return out
+    return chans
 
+def make_feature_names():
+    # muss gleiche Reihenfolge sein wie training
+    # Reihenfolge basiert auf dict insertion order in build_channels + jerk loop
+    # Python 3.7+ behält insertion order
+    base_names = ["AX", "AY", "AZ", "GX", "GY", "GZ", "acc_mag", "gyro_mag"]
+    jerk_names = [n + "_jerk" for n in base_names]
+    ch_names = base_names + jerk_names
 
-def maybe_plot_learning_curves(history, out_dir):
+    names = []
+    for cn in ch_names:
+        for fn in feat_names_1d:
+            names.append(cn + "_" + fn)
+    return names, ch_names
+
+FEATURE_NAMES, CHANNEL_NAMES = make_feature_names()
+
+def extract_windows_X(file_path):
     try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        return False
+        df = pd.read_csv(file_path)
+    except:
+        return None
 
-    if "acc" not in history or "val_acc" not in history:
-        return False
+    for c in BASE_COLS:
+        if c not in df.columns:
+            return None
 
-    os.makedirs(out_dir, exist_ok=True)
+    chans = build_channels(df)
 
-    # Accuracy
-    plt.figure()
-    plt.plot(history["acc"], label="Train Acc")
-    plt.plot(history["val_acc"], label="Val Acc")
-    plt.xlabel("Epoche")
-    plt.ylabel("Accuracy")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "learning_curves_acc.png"), dpi=140)
-    plt.close()
+    # sicherstellen: wir nehmen nur die channels in gleicher Reihenfolge wie training
+    n = len(df)
+    if n < WINDOW_SIZE:
+        return None
 
-    # Loss
-    if "loss" in history and "val_loss" in history:
-        plt.figure()
-        plt.plot(history["loss"], label="Train Loss")
-        plt.plot(history["val_loss"], label="Val Loss")
-        plt.xlabel("Epoche")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "learning_curves_loss.png"), dpi=140)
-        plt.close()
+    X = []
+    start = 0
+    while start + WINDOW_SIZE <= n:
+        feats = []
+        for cn in CHANNEL_NAMES:
+            x = chans[cn][start:start + WINDOW_SIZE]
+            feats += features_1d(x)
+        X.append(feats)
+        start += STRIDE
 
-    return True
+    if len(X) == 0:
+        return None
 
+    return np.array(X, dtype=float)
 
-# =========================
-# METRIKEN (ROBUST GEGEN 13 vs 3 KLASSEN)
-# =========================
-def predict_classes(model, X, batch_size=256):
-    probs = model.predict(X, batch_size=batch_size, verbose=0)
-    return np.argmax(probs, axis=1).astype(np.int64)
+def majority_vote(labels):
+    counts = {}
+    for lab in labels:
+        counts[lab] = counts.get(lab, 0) + 1
 
+    best = None
+    best_n = -1
+    for k in counts:
+        if counts[k] > best_n:
+            best = k
+            best_n = counts[k]
+    return best
 
-def compute_metrics(y_true, y_pred, class_names_all):
-    """
-    Robust:
-    - metadata.json kann mehr Klassen haben als y_true/y_pred enthalten.
-    - Wir evaluieren nur die Klassen, die tatsächlich vorkommen (labels_used).
-    """
-    labels_used = np.unique(np.concatenate([np.unique(y_true), np.unique(y_pred)])).astype(int)
+def collect_files_for_base_ids(base_ids_set):
+    # returns list of (true_label, base_id, file_path)
+    items = []
+    for label in os.listdir(STEP3_DIR):
+        label_path = os.path.join(STEP3_DIR, label)
+        if not os.path.isdir(label_path):
+            continue
 
-    class_names_used = []
-    for lab in labels_used:
-        if lab < len(class_names_all):
-            class_names_used.append(class_names_all[lab])
-        else:
-            class_names_used.append(f"Klasse_{lab}")
+        for file in os.listdir(label_path):
+            if not file.endswith(".csv"):
+                continue
 
-    acc = float(accuracy_score(y_true, y_pred))
+            base_id = get_base_id(file)
+            if base_id in base_ids_set:
+                items.append((label, base_id, os.path.join(label_path, file)))
+    return items
 
-    f1_macro = float(f1_score(
-        y_true, y_pred,
-        labels=labels_used,
-        average="macro",
-        zero_division=0
-    ))
-    f1_weighted = float(f1_score(
-        y_true, y_pred,
-        labels=labels_used,
-        average="weighted",
-        zero_division=0
-    ))
+def eval_window_level(model, items):
+    y_true, y_pred = [], []
+    used_files, used_windows = 0, 0
 
-    pr, rc, f1, supp = precision_recall_fscore_support(
-        y_true, y_pred,
-        labels=labels_used,
-        zero_division=0
-    )
+    for true_label, base_id, fp in items:
+        Xw = extract_windows_X(fp)
+        if Xw is None:
+            continue
 
-    per_class = []
-    for i, lab in enumerate(labels_used):
-        per_class.append({
-            "class_id": int(lab),
-            "class_name": class_names_used[i],
-            "precision": float(pr[i]),
-            "recall": float(rc[i]),
-            "f1": float(f1[i]),
-            "support": int(supp[i]),
-        })
+        pred = model.predict(Xw)
 
-    cm = confusion_matrix(y_true, y_pred, labels=labels_used).astype(int)
+        y_true += [true_label] * len(pred)
+        y_pred += list(pred)
 
-    report = classification_report(
-        y_true, y_pred,
-        labels=labels_used,
-        target_names=class_names_used,
-        digits=4,
-        zero_division=0
-    )
+        used_files += 1
+        used_windows += len(pred)
 
-    return {
-        "accuracy": acc,
-        "f1_macro": f1_macro,
-        "f1_weighted": f1_weighted,
-        "per_class": per_class,
-        "confusion_matrix": cm,
-        "labels_used": labels_used.tolist(),
-        "class_names_used": class_names_used,
-        "sklearn_report": report,
-    }
+    return y_true, y_pred, used_files, used_windows
 
+def eval_file_level(model, items):
+    # merge all window preds across all files sharing same base_id
+    base_true = {}
+    base_preds = {}
 
-# =========================
-# HARD TESTS
-# =========================
-def hardtest_apply(X, rng, mode, strength):
-    X2 = X.copy()
-    N, T, C = X2.shape
+    for true_label, base_id, fp in items:
+        Xw = extract_windows_X(fp)
+        if Xw is None:
+            continue
 
-    if mode == "jitter":
-        sigma = float(strength)
-        X2 += rng.normal(0.0, sigma, size=X2.shape).astype(np.float32)
+        pred = model.predict(Xw)
 
-    elif mode == "scaling":
-        scale_sigma = float(strength)
-        gains = (1.0 + rng.normal(0.0, scale_sigma, size=(1, 1, C))).astype(np.float32)
-        X2 *= gains
+        base_true[base_id] = true_label
+        if base_id not in base_preds:
+            base_preds[base_id] = []
+        base_preds[base_id] += list(pred)
 
-    elif mode == "timeshift":
-        max_shift = int(round(float(strength) * T))
-        max_shift = max(1, max_shift)
-        shift = int(rng.integers(-max_shift, max_shift + 1))
-        X2 = np.roll(X2, shift=shift, axis=1).astype(np.float32)
+    y_true, y_pred = [], []
+    for base_id in base_preds:
+        preds = base_preds[base_id]
+        if len(preds) == 0:
+            continue
+        y_true.append(base_true[base_id])
+        y_pred.append(majority_vote(preds))
 
-    elif mode == "dropout_block":
-        block = int(round(float(strength) * T))
-        block = max(1, min(block, T - 1))
-        start = int(rng.integers(0, T - block))
-        X2[:, start:start + block, :] = 0.0
-
-    elif mode == "channel_dropout":
-        p = float(strength)
-        mask = (rng.random((C,)) >= p).astype(np.float32)
-        X2 *= mask.reshape(1, 1, C)
-
-    else:
-        raise ValueError(f"Unbekannter Hardtest-Mode: {mode}")
-
-    return X2.astype(np.float32, copy=False)
-
-
-def run_hardtests(model, X_test, y_test, seed, batch_size):
-    rng = np.random.default_rng(seed)
-
-    tests = [
-        ("baseline", None, 0.0),
-
-        ("jitter_low", "jitter", 0.03),
-        ("jitter_med", "jitter", 0.06),
-
-        ("scaling_low", "scaling", 0.05),
-        ("scaling_med", "scaling", 0.10),
-
-        ("timeshift_5pct", "timeshift", 0.05),
-        ("timeshift_10pct", "timeshift", 0.10),
-
-        ("dropout_block_5pct", "dropout_block", 0.05),
-        ("dropout_block_10pct", "dropout_block", 0.10),
-
-        ("channel_dropout_10pct", "channel_dropout", 0.10),
-        ("channel_dropout_20pct", "channel_dropout", 0.20),
-    ]
-
-    rows = []
-    for name, mode, strength in tests:
-        if mode is None:
-            X_use = X_test
-        else:
-            X_use = hardtest_apply(X_test, rng, mode, strength)
-
-        y_pred = predict_classes(model, X_use, batch_size=batch_size)
-        acc = float(accuracy_score(y_test, y_pred))
-        f1m = float(f1_score(y_test, y_pred, average="macro"))
-
-        rows.append({
-            "test": name,
-            "mode": mode if mode else "none",
-            "strength": float(strength),
-            "accuracy": acc,
-            "f1_macro": f1m,
-        })
-
-    return rows
-
-
-# =========================
-# REPORT
-# =========================
-def build_report_de(overfit, val_metrics, test_metrics, hardtests):
-    lines = []
-    lines.append("Step 5 Report: Hard Test & Overfitting-Prüfung")
-    lines.append("")
-
-    lines.append("1) Overfitting-Analyse (aus Training/Val Verlauf)")
-    lines.append(f"- Beste Epoche: {overfit.get('best_epoch_1based', '-')}")
-    lines.append(f"- Beste Val-Accuracy: {overfit.get('best_val_acc', float('nan')):.4f}")
-    lines.append(f"- Train-Accuracy an bester Epoche: {overfit.get('train_acc_at_best', float('nan')):.4f}")
-    lines.append(f"- Generalization Gap (Train - Val): {overfit.get('acc_gap_at_best', float('nan')):.4f}")
-    if "val_loss_at_best" in overfit:
-        lines.append(f"- Train-Loss an bester Epoche: {overfit['train_loss_at_best']:.4f}")
-        lines.append(f"- Val-Loss an bester Epoche: {overfit['val_loss_at_best']:.4f}")
-        lines.append(f"- Loss Gap (Val - Train): {overfit['loss_gap_at_best']:.4f}")
-
-    gap = float(overfit.get("acc_gap_at_best", 0.0))
-    lines.append("")
-    lines.append("Interpretation (Daumenregel):")
-    if gap >= 0.10:
-        lines.append("- Gap ist groß. Overfitting wahrscheinlich.")
-    elif gap >= 0.05:
-        lines.append("- Gap ist sichtbar. Leichtes bis moderates Overfitting möglich.")
-    else:
-        lines.append("- Gap ist klein. Overfitting eher unkritisch.")
-
-    lines.append("")
-    lines.append("2) Metriken")
-    lines.append(f"- Val  Accuracy: {val_metrics['accuracy']:.4f} | F1 macro: {val_metrics['f1_macro']:.4f}")
-    lines.append(f"- Test Accuracy: {test_metrics['accuracy']:.4f} | F1 macro: {test_metrics['f1_macro']:.4f}")
-
-    lines.append("")
-    lines.append("3) Klassen-spezifisch (Test) – nur Klassen, die vorkommen")
-    for c in test_metrics["per_class"]:
-        lines.append(
-            f"- {c['class_name']} (id={c['class_id']}): "
-            f"P={c['precision']:.3f}, R={c['recall']:.3f}, F1={c['f1']:.3f}, Support={c['support']}"
-        )
-
-    lines.append("")
-    lines.append("4) Hard Tests (Robustheit)")
-    hard_sorted = sorted(hardtests, key=lambda r: r["accuracy"])
-    for r in hard_sorted:
-        lines.append(f"- {r['test']}: Accuracy={r['accuracy']:.4f}, F1_macro={r['f1_macro']:.4f}")
-
-    lines.append("")
-    lines.append("Hinweis:")
-    lines.append("Wenn Hard-Tests stark einbrechen, hilft oft bessere Augmentation,")
-    lines.append("mehr Regularisierung oder ein anderes Windowing/Modell.")
-
-    return "\n".join(lines)
-
+    return y_true, y_pred, len(base_preds)
 
 # =========================
 # MAIN
 # =========================
-def main():
-    print("Starte Step 5: Hard Test & Overfitting Check")
-    print("STEP3_DIR:", os.path.abspath(STEP3_DIR))
-    print("STEP4_DIR:", os.path.abspath(STEP4_DIR))
-    print("OUT_DIR  :", os.path.abspath(OUT_DIR))
+print("Loading model:", MODEL_PATH)
+model = joblib.load(MODEL_PATH)
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+train_df = pd.read_csv(TRAIN_BASES_PATH)
+test_df = pd.read_csv(TEST_BASES_PATH)
 
-    # Daten laden
-    val_path = os.path.join(STEP3_DIR, "val_norm.npz")
-    test_path = os.path.join(STEP3_DIR, "test_norm.npz")
-    X_val, y_val = load_npz(val_path)
-    X_test, y_test = load_npz(test_path)
+train_ids = set(train_df["base_id"].astype(str).tolist())
+test_ids = set(test_df["base_id"].astype(str).tolist())
 
-    # Modell + History laden
-    model_path = os.path.join(STEP4_DIR, "best_model.keras")
-    hist_path = os.path.join(STEP4_DIR, "train_history.json")
+print("Train base_ids:", len(train_ids))
+print("Test base_ids:", len(test_ids))
+print("Leakage check (muss 0 sein):", len(train_ids.intersection(test_ids)))
 
-    if not os.path.isfile(model_path):
-        raise FileNotFoundError(f"Model nicht gefunden: {model_path}")
-    if not os.path.isfile(hist_path):
-        raise FileNotFoundError(f"History nicht gefunden: {hist_path}")
+train_items = collect_files_for_base_ids(train_ids)
+test_items = collect_files_for_base_ids(test_ids)
 
-    model = tf.keras.models.load_model(model_path)
-    history = load_history(hist_path)
+print("\nTrain files found:", len(train_items))
+print("Test files found:", len(test_items))
 
-    # Klassen-Namen (optional)
-    class_names = try_load_classnames(STEP1_META)
-    if class_names is None:
-        k = int(max(y_val.max(), y_test.max()) + 1)
-        class_names = [f"Klasse_{i}" for i in range(k)]
+# -------------------------
+# Window-Level (Overfitting)
+# -------------------------
+print("\n================ WINDOW-LEVEL EVALUATION ================")
 
-    # Debug (hilft, wenn wieder mismatch ist)
-    print("\nDEBUG Klassen:")
-    print("  class_names (metadata) length:", len(class_names))
-    print("  y_val unique :", np.unique(y_val))
-    print("  y_test unique:", np.unique(y_test))
+y_true_tr, y_pred_tr, nfiles_tr, nw_tr = eval_window_level(model, train_items)
+y_true_te, y_pred_te, nfiles_te, nw_te = eval_window_level(model, test_items)
 
-    # Overfitting
-    overfit = summarize_overfitting(history)
+acc_tr = accuracy_score(y_true_tr, y_pred_tr) if len(y_true_tr) else 0.0
+acc_te = accuracy_score(y_true_te, y_pred_te) if len(y_true_te) else 0.0
 
-    # Val / Test metrics
-    y_val_pred = predict_classes(model, X_val, batch_size=BATCH_SIZE)
-    val_metrics = compute_metrics(y_val, y_val_pred, class_names)
+print("\nTRAIN Window-Accuracy:", acc_tr)
+print("Used train files:", nfiles_tr, " windows:", nw_tr)
 
-    y_test_pred = predict_classes(model, X_test, batch_size=BATCH_SIZE)
-    test_metrics = compute_metrics(y_test, y_test_pred, class_names)
+print("\nTEST Window-Accuracy:", acc_te)
+print("Used test files:", nfiles_te, " windows:", nw_te)
 
-    # Confusion Matrix CSV (Test) – mit class_names_used
-    write_confusion_csv(
-        os.path.join(OUT_DIR, "confusion_matrix.csv"),
-        test_metrics["confusion_matrix"],
-        test_metrics["class_names_used"]
-    )
+print("\nOverfitting Gap (train - test):", acc_tr - acc_te)
 
-    # Hard tests
-    hardtests = run_hardtests(model, X_test, y_test, seed=SEED_HARDTESTS, batch_size=BATCH_SIZE)
-    write_rows_csv(
-        os.path.join(OUT_DIR, "hardtests.csv"),
-        hardtests,
-        fieldnames=["test", "mode", "strength", "accuracy", "f1_macro"]
-    )
+print("\n--- TEST Classification Report (Window-Level) ---")
+print(classification_report(y_true_te, y_pred_te))
 
-    # Optional plots
-    plotted = maybe_plot_learning_curves(history, OUT_DIR)
+print("TEST Confusion Matrix (Window-Level):")
+print(confusion_matrix(y_true_te, y_pred_te))
 
-    # Report
-    report = build_report_de(overfit, val_metrics, test_metrics, hardtests)
-    write_text(os.path.join(OUT_DIR, "report_de.txt"), report)
+# -------------------------
+# File-Level (Hard Test)
+# -------------------------
+print("\n================ FILE-LEVEL (MAJORITY VOTE) ================")
 
-    # metrics.json
-    metrics = {
-        "overfitting": overfit,
-        "val": {
-            "accuracy": val_metrics["accuracy"],
-            "f1_macro": val_metrics["f1_macro"],
-            "f1_weighted": val_metrics["f1_weighted"],
-            "labels_used": val_metrics["labels_used"],
-            "class_names_used": val_metrics["class_names_used"],
-        },
-        "test": {
-            "accuracy": test_metrics["accuracy"],
-            "f1_macro": test_metrics["f1_macro"],
-            "f1_weighted": test_metrics["f1_weighted"],
-            "labels_used": test_metrics["labels_used"],
-            "class_names_used": test_metrics["class_names_used"],
-        },
-        "hardtests": hardtests,
-        "plots_created": bool(plotted),
-        "paths": {
-            "model": os.path.abspath(model_path),
-            "history": os.path.abspath(hist_path),
-            "val": os.path.abspath(val_path),
-            "test": os.path.abspath(test_path),
-        }
-    }
+y_true_tr_f, y_pred_tr_f, nb_tr = eval_file_level(model, train_items)
+y_true_te_f, y_pred_te_f, nb_te = eval_file_level(model, test_items)
 
-    with open(os.path.join(OUT_DIR, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
+acc_tr_f = accuracy_score(y_true_tr_f, y_pred_tr_f) if len(y_true_tr_f) else 0.0
+acc_te_f = accuracy_score(y_true_te_f, y_pred_te_f) if len(y_true_te_f) else 0.0
 
-    # Console summary
-    print("\nFERTIG ")
-    print(f"Val  Accuracy={val_metrics['accuracy']:.4f} | F1_macro={val_metrics['f1_macro']:.4f}")
-    print(f"Test Accuracy={test_metrics['accuracy']:.4f} | F1_macro={test_metrics['f1_macro']:.4f}")
-    print(f"Gap (Train-Val) an bester Epoche: {overfit.get('acc_gap_at_best', float('nan')):.4f}")
-    print("Outputs:", os.path.abspath(OUT_DIR))
-    print("  report_de.txt, metrics.json, confusion_matrix.csv, hardtests.csv")
-    if plotted:
-        print("  learning_curves_acc.png (und learning_curves_loss.png, falls vorhanden)")
+print("\nTRAIN File-Accuracy:", acc_tr_f, " (base files:", nb_tr, ")")
+print("TEST  File-Accuracy:", acc_te_f, " (base files:", nb_te, ")")
 
+print("\nOverfitting Gap FILE (train - test):", acc_tr_f - acc_te_f)
 
-if __name__ == "__main__":
-    main()
+print("\n--- TEST Classification Report (File-Level) ---")
+print(classification_report(y_true_te_f, y_pred_te_f))
 
+print("TEST Confusion Matrix (File-Level):")
+print(confusion_matrix(y_true_te_f, y_pred_te_f))
+
+print("\n✅ Step 5 fertig (Decision Tree Hard Test + Overfitting)")
