@@ -1,189 +1,64 @@
 import os
-import numpy as np
 import pandas as pd
-import json
-import random
 
-# =========================
-# EINSTELLUNGEN
-# =========================
-DATA_DIR = r"***************"   # <-- HIER anpassen (ORDNER)
-OUT_DIR = r"./STEP_1"
+# ===== Pfade =====
+INPUT_DIR = r"C:\Users\Oulad\Downloads\Devi"
+OUTPUT_DIR = r"C:\Users\Oulad\Downloads\Devi_step1"
 
-# Statt Sekunden: feste Sample-Längen (einfach + robust)
-WINDOW_LEN_SAMPLES = 100
-HOP_LEN_SAMPLES = 50
+# ===== Pflicht-Spalten =====
+COLUMNS = [
+    "Timestamp(ms)",
+    "AX(g)", "AY(g)", "AZ(g)",
+    "GX(deg/s)", "GY(deg/s)", "GZ(deg/s)"
+]
 
-TEST_SIZE = 0.15
-VAL_SIZE = 0.15
-SEED = 42
+# Output-Ordner erstellen
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
 
-SENSOR_COLS = ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"]
+# ===== Alle Labels =====
+for label in os.listdir(INPUT_DIR):
 
-COLUMN_ALIASES = {
-    "timestamp(ms)": "timestamp_ms",
-    "timestamp": "timestamp_ms",
-    "timestamp_ms": "timestamp_ms",
-    "ax(g)": "ax_g", "ay(g)": "ay_g", "az(g)": "az_g",
-    "gx(deg/s)": "gx_dps", "gy(deg/s)": "gy_dps", "gz(deg/s)": "gz_dps",
-    "ax": "ax_g", "ay": "ay_g", "az": "az_g",
-    "gx": "gx_dps", "gy": "gy_dps", "gz": "gz_dps",
-}
+    label_path = os.path.join(INPUT_DIR, label)
 
-def clean_col(c):
-    return str(c).strip().replace(" ", "").replace("\ufeff", "").lower()
+    if not os.path.isdir(label_path):
+        continue
 
-def make_windows_by_samples(data_2d):
-    """data_2d: shape [N, 6] -> Liste von Windows shape [WINDOW_LEN_SAMPLES, 6]"""
-    n = len(data_2d)
-    if n < WINDOW_LEN_SAMPLES:
-        return []
+    new_label_path = os.path.join(OUTPUT_DIR, label)
+    if not os.path.exists(new_label_path):
+        os.makedirs(new_label_path)
 
-    windows = []
-    for start in range(0, n - WINDOW_LEN_SAMPLES + 1, HOP_LEN_SAMPLES):
-        w = data_2d[start:start + WINDOW_LEN_SAMPLES]
-        windows.append(w)
-    return windows
+    # ===== Alle CSV-Dateien =====
+    for file in os.listdir(label_path):
 
-print("Starte Step 1 – einfache Version (fixed samples)")
-print("DATA_DIR:", DATA_DIR)
-
-if not os.path.isdir(DATA_DIR):
-    raise RuntimeError("DATA_DIR ist kein gültiger Ordner")
-
-os.makedirs(OUT_DIR, exist_ok=True)
-os.makedirs(os.path.join(OUT_DIR, "npz"), exist_ok=True)
-
-classes = [d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))]
-classes.sort()
-class_to_id = {c: i for i, c in enumerate(classes)}
-
-print("Gefundene Klassen:", classes)
-
-# CSV-Dateien sammeln (auch Unterordner, falls nötig)
-csv_files = []
-for cls in classes:
-    cls_dir = os.path.join(DATA_DIR, cls)
-    for root, _, files in os.walk(cls_dir):
-        for f in files:
-            if f.lower().endswith(".csv"):
-                csv_files.append((cls, os.path.join(root, f)))
-
-print("Gefundene CSVs:", len(csv_files))
-
-X_all = []
-y_all = []
-groups = []
-file_info = []
-
-file_id = 0
-
-for cls, path in csv_files:
-    print("\nDatei:", path)
-    try:
-        df = pd.read_csv(path, engine="python")
-        if df.shape[1] == 1:
-            df = pd.read_csv(path, sep=";", engine="python")
-
-        # Spaltennamen vereinheitlichen
-        rename = {}
-        for c in df.columns:
-            cc = clean_col(c)
-            if cc in COLUMN_ALIASES:
-                rename[c] = COLUMN_ALIASES[cc]
-        df = df.rename(columns=rename)
-
-        needed = ["timestamp_ms"] + SENSOR_COLS
-        if not all(c in df.columns for c in needed):
-            print(" -> Fehlende Spalten, skip")
+        if not file.endswith(".csv"):
             continue
 
-        df = df[needed].copy()
+        input_file = os.path.join(label_path, file)
 
-        # Numeric conversion
-        df["timestamp_ms"] = pd.to_numeric(df["timestamp_ms"], errors="coerce")
-        for c in SENSOR_COLS:
-            df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "."), errors="coerce")
-
-        df = df.dropna().sort_values("timestamp_ms")
-
-        data = df[SENSOR_COLS].values.astype(np.float32)  # [N,6]
-        windows = make_windows_by_samples(data)
-
-        if len(windows) == 0:
-            print(" -> Zu wenig Daten für Windows, skip")
+        try:
+            data = pd.read_csv(input_file)
+        except:
+            print("Fehler beim Lesen:", input_file)
             continue
 
-        X_all.extend(windows)
-        y_all.extend([class_to_id[cls]] * len(windows))
-        groups.extend([file_id] * len(windows))
+        # prüfen ob alle Spalten da sind
+        ok = True
+        for c in COLUMNS:
+            if c not in data.columns:
+                ok = False
 
-        file_info.append({
-            "file_id": file_id,
-            "class": cls,
-            "path": path,
-            "num_samples": int(len(data)),
-            "num_windows": int(len(windows)),
-        })
+        if not ok:
+            print("Spalten fehlen:", input_file)
+            continue
 
-        print(" -> OK | samples:", len(data), "| windows:", len(windows))
-        file_id += 1
+        # nur wichtige Spalten behalten
+        data = data[COLUMNS]
 
-    except Exception as e:
-        print(" -> FEHLER:", e)
+        # neue CSV speichern
+        output_file = os.path.join(new_label_path, file)
+        data.to_csv(output_file, index=False)
 
-if len(X_all) == 0:
-    raise RuntimeError("Keine Windows erzeugt. Prüfe CSVs oder WINDOW_LEN_SAMPLES/HOP_LEN_SAMPLES.")
+        print("Gespeichert:", output_file)
 
-# WICHTIG: np.stack statt np.array
-X_all = np.stack(X_all, axis=0)  # [num_windows, WINDOW_LEN_SAMPLES, 6]
-y_all = np.array(y_all, dtype=np.int64)
-groups = np.array(groups, dtype=np.int64)
-
-print("\nGesamt Windows:", len(y_all))
-print("X_all shape:", X_all.shape)
-
-# =========================
-# SPLIT (nach Datei)
-# =========================
-file_ids = sorted(list(set(groups.tolist())))
-random.seed(SEED)
-random.shuffle(file_ids)
-
-n_test = int(len(file_ids) * TEST_SIZE)
-n_val = int(len(file_ids) * VAL_SIZE)
-
-test_files = set(file_ids[:n_test])
-val_files = set(file_ids[n_test:n_test + n_val])
-train_files = set(file_ids[n_test + n_val:])
-
-def mask(files_set):
-    return np.array([g in files_set for g in groups], dtype=bool)
-
-X_train, y_train = X_all[mask(train_files)], y_all[mask(train_files)]
-X_val, y_val = X_all[mask(val_files)], y_all[mask(val_files)]
-X_test, y_test = X_all[mask(test_files)], y_all[mask(test_files)]
-
-print("\nSplit:")
-print("Train:", len(y_train))
-print("Val  :", len(y_val))
-print("Test :", len(y_test))
-
-# =========================
-# SPEICHERN
-# =========================
-np.savez_compressed(os.path.join(OUT_DIR, "npz", "train.npz"), X=X_train, y=y_train)
-np.savez_compressed(os.path.join(OUT_DIR, "npz", "val.npz"), X=X_val, y=y_val)
-np.savez_compressed(os.path.join(OUT_DIR, "npz", "test.npz"), X=X_test, y=y_test)
-
-with open(os.path.join(OUT_DIR, "metadata.json"), "w", encoding="utf-8") as f:
-    json.dump({
-        "classes": classes,
-        "class_to_id": class_to_id,
-        "window_len_samples": WINDOW_LEN_SAMPLES,
-        "hop_len_samples": HOP_LEN_SAMPLES,
-        "files": file_info
-    }, f, indent=2, ensure_ascii=False)
-
-print("\nFERTIG ")
-print("Output:", os.path.abspath(OUT_DIR))
+print("✅ STEP 1 abgeschlossen")
