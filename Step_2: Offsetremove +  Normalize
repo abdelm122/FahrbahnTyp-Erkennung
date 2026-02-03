@@ -1,180 +1,73 @@
-# 02_offsetremove_normalize_simple.py
-# ------------------------------------------------------------
-# 
-#
-# Input (aus Step 1):
-#   STEP_1/npz/train.npz
-#   STEP_1/npz/val.npz
-#   STEP_1/npz/test.npz
-#
-# In jeder NPZ:
-#   X: [N, T, 6]
-#   y: [N]
-#
-# Was wird gemacht?
-# 1) Offset Removal pro Window: X = X - mean_over_time (pro Kanal)
-# 2) Normalisierung: mean/std pro Kanal aus TRAIN (nach Offset Removal)
-# 3) Val/Test benutzen dieselben mean/std (kein Leakage)
-# 4) Optional: Clipping (z.B. 5.0)
-#
-# Output:
-#   STEP_2/npz/train_norm.npz, val_norm.npz, test_norm.npz
-#   STEP_2/norm_params.json
-# ------------------------------------------------------------
-
 import os
-import json
-import numpy as np
+import pandas as pd
 
-# =========================
-# EINSTELLUNGEN
-# =========================
-IN_DIR = r"./STEP_1/npz"
-OUT_DIR = r"./STEP_2"
+# ===== Pfade =====
+INPUT_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step1"
+OUTPUT_DIR = r"C:\Users\Oulad\Downloads\Devi_step2"
 
-CLIP = 5.0      # <= 0 deaktiviert
-EPS = 1e-6
+# ===== Sensor-Spalten =====
+SENSOR_COLS = [
+    "AX(g)", "AY(g)", "AZ(g)",
+    "GX(deg/s)", "GY(deg/s)", "GZ(deg/s)"
+]
 
-CHANNELS = ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"]
+EPS = 1e-8  # gegen Division durch 0
 
+# Output Ordner erstellen
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
 
-# =========================
-# HELFER
-# =========================
-def load_npz(path):
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+# ===== durch alle Label-Ordner =====
+for label in os.listdir(INPUT_DIR):
 
-    d = np.load(path)
-    if "X" not in d or "y" not in d:
-        raise ValueError(f"NPZ muss Keys 'X' und 'y' enthalten: {path}")
+    label_path = os.path.join(INPUT_DIR, label)
+    if not os.path.isdir(label_path):
+        continue
 
-    X = d["X"].astype(np.float32, copy=False)
-    y = d["y"].astype(np.int64, copy=False)
+    out_label_path = os.path.join(OUTPUT_DIR, label)
+    if not os.path.exists(out_label_path):
+        os.makedirs(out_label_path)
 
-    if X.ndim != 3 or X.shape[2] != 6:
-        raise ValueError(f"X muss Shape [N, T, 6] haben. Bekommen: {X.shape} in {path}")
-    if y.ndim != 1 or y.shape[0] != X.shape[0]:
-        raise ValueError(f"y muss Shape [N] haben. X:{X.shape} y:{y.shape} in {path}")
+    # ===== durch alle CSV-Dateien im Label =====
+    for file in os.listdir(label_path):
 
-    return X, y
+        if not file.endswith(".csv"):
+            continue
 
+        in_file = os.path.join(label_path, file)
 
-def save_npz(path, X, y):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    np.savez_compressed(path, X=X.astype(np.float32, copy=False), y=y.astype(np.int64, copy=False))
+        try:
+            data = pd.read_csv(in_file)
+        except:
+            print("Fehler beim Lesen:", in_file)
+            continue
 
+        # prüfen ob alle Sensor-Spalten existieren
+        ok = True
+        for c in SENSOR_COLS:
+            if c not in data.columns:
+                ok = False
+        if not ok:
+            print("Spalten fehlen:", in_file)
+            continue
 
-def offset_remove_per_window(X):
-    # X: [N, T, C]
-    mu = X.mean(axis=1, keepdims=True)  # [N, 1, C]
-    return X - mu
+        # ===== 1) OFFSET REMOVE (Mittelwert abziehen) =====
+        for c in SENSOR_COLS:
+            x = data[c].astype(float)
+            mean = x.mean()
+            data[c] = x - mean
 
+        # ===== 2) NORMALIZE (durch Standardabweichung teilen) =====
+        for c in SENSOR_COLS:
+            x = data[c].astype(float)
+            std = x.std(ddof=0)   # ddof=0 = stabil für ML
+            data[c] = x / (std + EPS)
 
-def compute_mean_std_from_train(X_train, eps=1e-6):
-    # über N und T gemittelt -> pro Kanal
-    flat = X_train.reshape(-1, X_train.shape[2])  # [N*T, C]
-    mean = flat.mean(axis=0)
-    std = flat.std(axis=0)
-    std = np.maximum(std, eps)
-    return mean.astype(np.float32), std.astype(np.float32)
+        # speichern
+        out_file = os.path.join(out_label_path, file)
+        data.to_csv(out_file, index=False)
 
+        print("Gespeichert:", out_file)
 
-def standardize(X, mean, std):
-    return (X - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
+print("✅ STEP 2 abgeschlossen")
 
-
-def clip_values(X, clip):
-    if clip is None or clip <= 0:
-        return X
-    return np.clip(X, -clip, clip)
-
-
-def print_channel_stats(title, X):
-    flat = X.reshape(-1, X.shape[2])
-    m = flat.mean(axis=0)
-    s = flat.std(axis=0)
-    print(title, "| shape =", X.shape)
-    for i, ch in enumerate(CHANNELS):
-        print(f"  {ch:6s}  mean={m[i]: .4f}  std={s[i]: .4f}")
-
-
-# =========================
-# MAIN
-# =========================
-def main():
-    print("Starte Step 2: Offset Removal + Normalisierung")
-    print("IN_DIR :", os.path.abspath(IN_DIR))
-    print("OUT_DIR:", os.path.abspath(OUT_DIR))
-    print("CLIP =", CLIP, "| EPS =", EPS)
-
-    train_path = os.path.join(IN_DIR, "train.npz")
-    val_path = os.path.join(IN_DIR, "val.npz")
-    test_path = os.path.join(IN_DIR, "test.npz")
-
-    # 1) Laden
-    X_train_raw, y_train = load_npz(train_path)
-    X_val_raw, y_val = load_npz(val_path)
-    X_test_raw, y_test = load_npz(test_path)
-
-    print("\nGeladen:")
-    print("  Train:", X_train_raw.shape, y_train.shape)
-    print("  Val  :", X_val_raw.shape, y_val.shape)
-    print("  Test :", X_test_raw.shape, y_test.shape)
-
-    # 2) Offset Removal (pro Window)
-    X_train_off = offset_remove_per_window(X_train_raw)
-    X_val_off = offset_remove_per_window(X_val_raw)
-    X_test_off = offset_remove_per_window(X_test_raw)
-
-    # 3) Norm-Parameter nur aus Train
-    mean, std = compute_mean_std_from_train(X_train_off, eps=EPS)
-
-    print("\nTrain-Normparameter (nach Offset Removal):")
-    for i, ch in enumerate(CHANNELS):
-        print(f"  {ch:6s}  mean={mean[i]: .6f}  std={std[i]: .6f}")
-
-    # 4) Standardisierung + optional Clip
-    X_train = clip_values(standardize(X_train_off, mean, std), CLIP).astype(np.float32)
-    X_val = clip_values(standardize(X_val_off, mean, std), CLIP).astype(np.float32)
-    X_test = clip_values(standardize(X_test_off, mean, std), CLIP).astype(np.float32)
-
-    print("\nKurz-Check nach Normalisierung:")
-    print_channel_stats("Train", X_train)
-    print_channel_stats("Val  ", X_val)
-    print_channel_stats("Test ", X_test)
-
-    # 5) Speichern
-    npz_out = os.path.join(OUT_DIR, "npz")
-    save_npz(os.path.join(npz_out, "train_norm.npz"), X_train, y_train)
-    save_npz(os.path.join(npz_out, "val_norm.npz"), X_val, y_val)
-    save_npz(os.path.join(npz_out, "test_norm.npz"), X_test, y_test)
-
-    # 6) norm_params.json (für später)
-    meta = {
-        "in_dir": os.path.abspath(IN_DIR),
-        "out_dir": os.path.abspath(OUT_DIR),
-        "channels": CHANNELS,
-        "offset_removal": "per_window_mean_subtraction",
-        "normalization": "train_channelwise_standardization",
-        "eps": float(EPS),
-        "clip": float(CLIP),
-        "train_mean": mean.astype(float).tolist(),
-        "train_std": std.astype(float).tolist(),
-        "note": "Val/Test wurden mit Train-Parametern normalisiert (kein Leakage)."
-    }
-
-    os.makedirs(OUT_DIR, exist_ok=True)
-    with open(os.path.join(OUT_DIR, "norm_params.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-    print("\nFERTIG")
-    print("Outputs:")
-    print(" ", os.path.join(npz_out, "train_norm.npz"))
-    print(" ", os.path.join(npz_out, "val_norm.npz"))
-    print(" ", os.path.join(npz_out, "test_norm.npz"))
-    print(" ", os.path.join(OUT_DIR, "norm_params.json"))
-
-
-if __name__ == "__main__":
-    main()
