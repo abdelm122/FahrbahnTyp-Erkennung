@@ -1,0 +1,183 @@
+import os
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import joblib
+
+# ===== Paths =====
+INPUT_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step3"
+OUTPUT_DIR = r"C:\Users\Oulad\Downloads\Devi_step4_dt_tuned"
+
+# ===== Base columns =====
+BASE_COLS = ["AX(g)", "AY(g)", "AZ(g)", "GX(deg/s)", "GY(deg/s)", "GZ(deg/s)"]
+
+# ===== Windowing =====
+WINDOW_SIZE = 256
+STRIDE = 128
+
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+def get_base_id(filename):
+    name = filename.replace(".csv", "")
+    return name.split("__")[0]
+
+def features_1d(x):
+    x = np.asarray(x, dtype=float)
+    mean = np.mean(x)
+    std = np.std(x)
+    mn = np.min(x)
+    mx = np.max(x)
+    rms = np.sqrt(np.mean(x * x))
+    med = np.median(x)
+    q25 = np.percentile(x, 25)
+    q75 = np.percentile(x, 75)
+    iqr = q75 - q25
+    energy = np.mean(x * x)
+    return [mean, std, mn, mx, rms, med, iqr, energy]
+
+feat_names_1d = ["mean", "std", "min", "max", "rms", "median", "iqr", "energy"]
+
+def build_channels(df):
+    AX = df["AX(g)"].astype(float).to_numpy()
+    AY = df["AY(g)"].astype(float).to_numpy()
+    AZ = df["AZ(g)"].astype(float).to_numpy()
+    GX = df["GX(deg/s)"].astype(float).to_numpy()
+    GY = df["GY(deg/s)"].astype(float).to_numpy()
+    GZ = df["GZ(deg/s)"].astype(float).to_numpy()
+
+    acc_mag = np.sqrt(AX*AX + AY*AY + AZ*AZ)
+    gyro_mag = np.sqrt(GX*GX + GY*GY + GZ*GZ)
+
+    chans = {
+        "AX": AX, "AY": AY, "AZ": AZ,
+        "GX": GX, "GY": GY, "GZ": GZ,
+        "acc_mag": acc_mag,
+        "gyro_mag": gyro_mag
+    }
+
+    # jerk
+    for k in list(chans.keys()):
+        x = chans[k]
+        chans[k + "_jerk"] = np.diff(x, prepend=x[0])
+
+    return chans
+
+# ===== Build dataset (windows) =====
+rows = []
+feature_names = None
+
+for label in os.listdir(INPUT_DIR):
+    label_path = os.path.join(INPUT_DIR, label)
+    if not os.path.isdir(label_path):
+        continue
+
+    for file in os.listdir(label_path):
+        if not file.endswith(".csv"):
+            continue
+
+        fp = os.path.join(label_path, file)
+        try:
+            df = pd.read_csv(fp)
+        except:
+            continue
+
+        ok = True
+        for c in BASE_COLS:
+            if c not in df.columns:
+                ok = False
+        if not ok:
+            continue
+
+        base_id = get_base_id(file)
+        chans = build_channels(df)
+        ch_names = list(chans.keys())
+
+        if feature_names is None:
+            feature_names = []
+            for cn in ch_names:
+                for fn in feat_names_1d:
+                    feature_names.append(cn + "_" + fn)
+
+        n = len(df)
+        if n < WINDOW_SIZE:
+            continue
+
+        start = 0
+        while start + WINDOW_SIZE <= n:
+            feats = []
+            for cn in ch_names:
+                x = chans[cn][start:start + WINDOW_SIZE]
+                feats += features_1d(x)
+
+            rows.append([label, file, base_id] + feats)
+            start += STRIDE
+
+print("Window samples:", len(rows))
+if len(rows) == 0:
+    raise SystemExit("No samples (WINDOW_SIZE too big?)")
+
+data = pd.DataFrame(rows, columns=["label", "file", "base_id"] + feature_names)
+
+# ===== Leakage-free split =====
+unique_bases = data[["base_id", "label"]].drop_duplicates()
+
+train_bases, test_bases = train_test_split(
+    unique_bases,
+    test_size=0.2,
+    random_state=42,
+    stratify=unique_bases["label"]
+)
+
+train_ids = set(train_bases["base_id"].tolist())
+test_ids = set(test_bases["base_id"].tolist())
+print("Leakage check:", len(train_ids.intersection(test_ids)))
+
+train_df = data[data["base_id"].isin(train_ids)]
+test_df = data[data["base_id"].isin(test_ids)]
+
+X_train = train_df[feature_names].values
+y_train = train_df["label"].values
+X_test = test_df[feature_names].values
+y_test = test_df["label"].values
+
+# ===== Decision Tree + Grid Search =====
+base_model = DecisionTreeClassifier(random_state=42)
+
+param_grid = {
+    "criterion": ["gini", "entropy"],
+    "max_depth": [5, 8, 10, 12, 15, 20, None],
+    "min_samples_leaf": [1, 3, 5, 10],
+    "min_samples_split": [2, 5, 10, 20]
+}
+
+grid = GridSearchCV(
+    base_model,
+    param_grid=param_grid,
+    cv=3,
+    n_jobs=-1,
+    verbose=1
+)
+
+grid.fit(X_train, y_train)
+
+best_model = grid.best_estimator_
+print("\nBest params:", grid.best_params_)
+
+pred = best_model.predict(X_test)
+acc = accuracy_score(y_test, pred)
+
+print("\n✅ Window-Accuracy:", acc)
+print("\nClassification Report:")
+print(classification_report(y_test, pred))
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, pred))
+
+joblib.dump(best_model, os.path.join(OUTPUT_DIR, "decision_tree_tuned.joblib"))
+train_bases.to_csv(os.path.join(OUTPUT_DIR, "train_base_ids.csv"), index=False)
+test_bases.to_csv(os.path.join(OUTPUT_DIR, "test_base_ids.csv"), index=False)
+
+print("\n✅ Saved to:", OUTPUT_DIR)
