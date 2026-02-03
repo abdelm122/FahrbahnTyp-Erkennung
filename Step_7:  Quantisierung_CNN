@@ -1,0 +1,438 @@
+import os
+import re
+import json
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+# ============================================================
+#  Quantisierung Tiny 1D CNN -> TFLite (FP32 + INT8)
+# + Evaluation: Window-Level + File-Level (Majority Vote)
+# ============================================================
+
+# =========================
+# PATHS (anpassen)
+# =========================
+STEP3_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step3"
+KERAS_MODEL_PATH = r"C:\Users\Oulad\Downloads\Devi\Devi_step4_cnn_leakcheck\tiny_cnn_1d.keras"
+
+OUT_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step6_cnn_quant"
+if not os.path.exists(OUT_DIR):
+    os.makedirs(OUT_DIR)
+
+TFLITE_FP32_PATH = os.path.join(OUT_DIR, "tiny_cnn_fp32.tflite")
+TFLITE_INT8_PATH = os.path.join(OUT_DIR, "tiny_cnn_int8.tflite")
+REPORT_PATH = os.path.join(OUT_DIR, "step6_report.txt")
+
+# =========================
+# SETTINGS (wie Step5)
+# =========================
+SENSOR_COLS = ["AX(g)", "AY(g)", "AZ(g)", "GX(deg/s)", "GY(deg/s)", "GZ(deg/s)"]
+WINDOW_SIZE = 256
+
+# Für Evaluation: random windows pro Datei
+WINDOWS_PER_FILE_EVAL = 12
+
+# Für INT8 Representative Dataset
+REP_SAMPLES = 300  # 200-500 ist ok, größer = langsamer
+RANDOM_STATE = 42
+
+# =========================
+# ROBUST base_id (wie Step4/Step5 leakcheck)
+# =========================
+def get_base_id(filename):
+    name = filename.lower().replace(".csv", "")
+
+    name = re.sub(r"(__|_|-)?aug\d+$", "", name)
+    name = re.sub(r"(__|_|-)?orig$", "", name)
+    name = re.sub(r"(__|_|-)?original$", "", name)
+    name = re.sub(r"(__|_|-)?shift\d+$", "", name)
+    name = re.sub(r"(__|_|-)?noise\d+$", "", name)
+    name = re.sub(r"(__|_|-)?scale\d+$", "", name)
+
+    if "__" in name:
+        name = name.split("__")[0]
+
+    return name
+
+def is_aug_file(filename):
+    fn = filename.lower()
+    return ("__aug" in fn) or ("_aug" in fn) or ("-aug" in fn) or (re.search(r"aug\d+", fn) is not None)
+
+# =========================
+# DATA HELPERS
+# =========================
+def read_signal(fp):
+    try:
+        df = pd.read_csv(fp)
+    except:
+        return None
+
+    for c in SENSOR_COLS:
+        if c not in df.columns:
+            return None
+
+    sig = df[SENSOR_COLS].astype(np.float32).to_numpy()
+    if len(sig) < WINDOW_SIZE:
+        return None
+    return sig
+
+def random_windows_from_signal(sig, n_windows, rng):
+    n = len(sig)
+    if n < WINDOW_SIZE:
+        return None
+
+    max_start = n - WINDOW_SIZE
+    if max_start <= 0:
+        return sig[:WINDOW_SIZE][None, :, :]
+
+    starts = rng.integers(0, max_start + 1, size=n_windows)
+    ws = [sig[s:s+WINDOW_SIZE, :] for s in starts]
+    return np.stack(ws, axis=0)  # (n_windows, W, 6)
+
+def collect_files(step3_dir):
+    items = []
+    labels = [d for d in os.listdir(step3_dir) if os.path.isdir(os.path.join(step3_dir, d))]
+    labels = sorted(labels)
+
+    for lab in labels:
+        lab_dir = os.path.join(step3_dir, lab)
+        for fn in os.listdir(lab_dir):
+            if not fn.endswith(".csv"):
+                continue
+            fp = os.path.join(lab_dir, fn)
+            items.append({
+                "label": lab,
+                "fn": fn,
+                "fp": fp,
+                "base_id": get_base_id(fn),
+                "aug": is_aug_file(fn),
+            })
+    return items, labels
+
+def make_base_split(items, label_to_id):
+    # Split base_ids NUR aus orig, damit test "real" bleibt
+    base_to_label = {}
+    for it in items:
+        if it["aug"]:
+            continue
+        base_to_label[it["base_id"]] = it["label"]
+
+    base_ids = sorted(list(base_to_label.keys()))
+    if len(base_ids) == 0:
+        raise SystemExit("❌ No original base_ids found. Check filenames and is_aug_file().")
+
+    base_y = np.array([label_to_id[base_to_label[b]] for b in base_ids], dtype=np.int32)
+
+    train_bases, test_bases = train_test_split(
+        np.array(base_ids),
+        test_size=0.2,
+        random_state=RANDOM_STATE,
+        stratify=base_y
+    )
+    return set(train_bases.tolist()), set(test_bases.tolist())
+
+# =========================
+# TFLite helpers
+# =========================
+def tflite_predict(interpreter, X):
+    """
+    X: float32 array shape (N, W, 6)
+    returns class ids (N,)
+    Supports FP32 and INT8 TFLite models.
+    """
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    in_dtype = input_details[0]["dtype"]
+    out_dtype = output_details[0]["dtype"]
+
+    in_scale, in_zp = input_details[0].get("quantization", (0.0, 0))
+    out_scale, out_zp = output_details[0].get("quantization", (0.0, 0))
+
+    preds = []
+    for i in range(len(X)):
+        x = X[i:i+1]  # (1, W, 6) float32
+
+        if in_dtype == np.int8:
+            # quantize input
+            if in_scale == 0:
+                raise RuntimeError("Input quantization scale is 0 (unexpected).")
+            xq = np.round(x / in_scale + in_zp).astype(np.int32)
+            xq = np.clip(xq, -128, 127).astype(np.int8)
+            interpreter.set_tensor(input_details[0]["index"], xq)
+        else:
+            interpreter.set_tensor(input_details[0]["index"], x.astype(np.float32))
+
+        interpreter.invoke()
+        y = interpreter.get_tensor(output_details[0]["index"])
+
+        # if output is int8, dequantize to float for argmax
+        if out_dtype == np.int8:
+            y = (y.astype(np.float32) - out_zp) * out_scale
+
+        preds.append(int(np.argmax(y, axis=1)[0]))
+
+    return np.array(preds, dtype=int)
+
+def eval_split_tflite(interpreter, items, allowed_base_ids, label_to_id, labels, use_aug, use_orig, windows_per_file):
+    rng = np.random.default_rng(RANDOM_STATE)
+
+    y_true_windows = []
+    y_pred_windows = []
+
+    base_true = {}
+    base_votes = {}
+
+    used_files = 0
+    used_windows = 0
+
+    for it in items:
+        base_id = it["base_id"]
+        if base_id not in allowed_base_ids:
+            continue
+        if it["aug"] and not use_aug:
+            continue
+        if (not it["aug"]) and not use_orig:
+            continue
+
+        sig = read_signal(it["fp"])
+        if sig is None:
+            continue
+
+        ws = random_windows_from_signal(sig, windows_per_file, rng)
+        if ws is None:
+            continue
+
+        used_files += 1
+        used_windows += len(ws)
+
+        y_true = label_to_id[it["label"]]
+        y_pred = tflite_predict(interpreter, ws)
+
+        y_true_windows += [y_true] * len(ws)
+        y_pred_windows += y_pred.tolist()
+
+        if base_id not in base_true:
+            base_true[base_id] = y_true
+            base_votes[base_id] = []
+        base_votes[base_id] += y_pred.tolist()
+
+    y_true_windows = np.array(y_true_windows, dtype=int)
+    y_pred_windows = np.array(y_pred_windows, dtype=int)
+
+    win_acc = accuracy_score(y_true_windows, y_pred_windows) if len(y_true_windows) else 0.0
+
+    base_ids = sorted(base_true.keys())
+    y_true_files = []
+    y_pred_files = []
+
+    for b in base_ids:
+        votes = base_votes[b]
+        counts = np.bincount(np.array(votes, dtype=int), minlength=len(labels))
+        y_true_files.append(base_true[b])
+        y_pred_files.append(int(np.argmax(counts)))
+
+    y_true_files = np.array(y_true_files, dtype=int)
+    y_pred_files = np.array(y_pred_files, dtype=int)
+
+    file_acc = accuracy_score(y_true_files, y_pred_files) if len(y_true_files) else 0.0
+
+    return {
+        "used_files": used_files,
+        "used_windows": used_windows,
+        "win_acc": win_acc,
+        "y_true_windows": y_true_windows,
+        "y_pred_windows": y_pred_windows,
+        "file_acc": file_acc,
+        "y_true_files": y_true_files,
+        "y_pred_files": y_pred_files,
+        "n_base_files": len(y_true_files),
+    }
+
+# =========================
+# Representative dataset generator (INT8)
+# =========================
+def representative_data_gen(X_rep):
+    # X_rep shape: (N, W, 6) float32
+    for i in range(len(X_rep)):
+        yield [X_rep[i:i+1].astype(np.float32)]
+
+# =========================
+# MAIN
+# =========================
+np.random.seed(RANDOM_STATE)
+tf.random.set_seed(RANDOM_STATE)
+
+print("Loading Step3 file list...")
+items, labels = collect_files(STEP3_DIR)
+label_to_id = {lab: i for i, lab in enumerate(labels)}
+
+train_ids, test_ids = make_base_split(items, label_to_id)
+print("Train base_ids:", len(train_ids))
+print("Test  base_ids:", len(test_ids))
+print("Leakage check (muss 0 sein):", len(train_ids.intersection(test_ids)))
+
+print("\nLoading Keras model:", KERAS_MODEL_PATH)
+keras_model = tf.keras.models.load_model(KERAS_MODEL_PATH)
+
+# ------------------------------------------------------------
+# Build a small representative dataset from TRAIN (orig+aug)
+# ------------------------------------------------------------
+print("\nBuilding representative dataset for INT8...")
+rng = np.random.default_rng(RANDOM_STATE)
+
+rep_windows = []
+for it in items:
+    if it["base_id"] not in train_ids:
+        continue
+    # use both orig+aug for representative
+    sig = read_signal(it["fp"])
+    if sig is None:
+        continue
+    ws = random_windows_from_signal(sig, 2, rng)  # 2 windows per file
+    if ws is None:
+        continue
+    rep_windows.append(ws)
+    if sum(len(x) for x in rep_windows) >= REP_SAMPLES:
+        break
+
+if len(rep_windows) == 0:
+    raise SystemExit("❌ Could not create representative dataset. Check Step3 files.")
+
+X_rep = np.concatenate(rep_windows, axis=0).astype(np.float32)
+if len(X_rep) > REP_SAMPLES:
+    X_rep = X_rep[:REP_SAMPLES]
+
+print("Representative windows:", len(X_rep), "shape:", X_rep.shape)
+
+# ------------------------------------------------------------
+# Convert to TFLite FP32
+# ------------------------------------------------------------
+print("\nConverting to TFLite FP32...")
+converter_fp32 = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+tflite_fp32 = converter_fp32.convert()
+with open(TFLITE_FP32_PATH, "wb") as f:
+    f.write(tflite_fp32)
+print("✅ Saved:", TFLITE_FP32_PATH)
+
+# ------------------------------------------------------------
+# Convert to TFLite INT8 (full integer quantization)
+# ------------------------------------------------------------
+print("\nConverting to TFLite INT8...")
+converter_int8 = tf.lite.TFLiteConverter.from_keras_model(keras_model)
+converter_int8.optimizations = [tf.lite.Optimize.DEFAULT]
+converter_int8.representative_dataset = lambda: representative_data_gen(X_rep)
+
+# full int8
+converter_int8.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+converter_int8.inference_input_type = tf.int8
+converter_int8.inference_output_type = tf.int8
+
+tflite_int8 = converter_int8.convert()
+with open(TFLITE_INT8_PATH, "wb") as f:
+    f.write(tflite_int8)
+print("✅ Saved:", TFLITE_INT8_PATH)
+
+# ------------------------------------------------------------
+# Evaluate both TFLite models using same Step5 logic
+# Train: orig+aug (train_ids)
+# Test : orig only (test_ids)
+# ------------------------------------------------------------
+def load_interpreter(tflite_path):
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+    return interpreter
+
+fp32_size = os.path.getsize(TFLITE_FP32_PATH)
+int8_size = os.path.getsize(TFLITE_INT8_PATH)
+
+print("\nModel sizes:")
+print("FP32 TFLite bytes:", fp32_size)
+print("INT8 TFLite bytes:", int8_size)
+if fp32_size > 0:
+    print("Compression ratio (INT8/FP32):", int8_size / fp32_size)
+
+print("\n================ EVALUATION: TFLite FP32 ================")
+interp_fp32 = load_interpreter(TFLITE_FP32_PATH)
+
+train_fp32 = eval_split_tflite(interp_fp32, items, train_ids, label_to_id, labels,
+                               use_aug=True, use_orig=True, windows_per_file=WINDOWS_PER_FILE_EVAL)
+test_fp32 = eval_split_tflite(interp_fp32, items, test_ids, label_to_id, labels,
+                              use_aug=False, use_orig=True, windows_per_file=WINDOWS_PER_FILE_EVAL)
+
+print("FP32 TRAIN Window-Acc:", train_fp32["win_acc"])
+print("FP32 TEST  Window-Acc:", test_fp32["win_acc"])
+print("FP32 TRAIN File-Acc  :", train_fp32["file_acc"], " (base files:", train_fp32["n_base_files"], ")")
+print("FP32 TEST  File-Acc  :", test_fp32["file_acc"], " (base files:", test_fp32["n_base_files"], ")")
+
+print("\nFP32 TEST Confusion (Window):")
+print(confusion_matrix(test_fp32["y_true_windows"], test_fp32["y_pred_windows"]))
+print("\nFP32 TEST Report (Window):")
+print(classification_report(test_fp32["y_true_windows"], test_fp32["y_pred_windows"], target_names=labels))
+
+print("\nFP32 TEST Confusion (File):")
+print(confusion_matrix(test_fp32["y_true_files"], test_fp32["y_pred_files"]))
+print("\nFP32 TEST Report (File):")
+print(classification_report(test_fp32["y_true_files"], test_fp32["y_pred_files"], target_names=labels))
+
+print("\n================ EVALUATION: TFLite INT8 ================")
+interp_int8 = load_interpreter(TFLITE_INT8_PATH)
+
+train_int8 = eval_split_tflite(interp_int8, items, train_ids, label_to_id, labels,
+                               use_aug=True, use_orig=True, windows_per_file=WINDOWS_PER_FILE_EVAL)
+test_int8 = eval_split_tflite(interp_int8, items, test_ids, label_to_id, labels,
+                              use_aug=False, use_orig=True, windows_per_file=WINDOWS_PER_FILE_EVAL)
+
+print("INT8 TRAIN Window-Acc:", train_int8["win_acc"])
+print("INT8 TEST  Window-Acc:", test_int8["win_acc"])
+print("INT8 TRAIN File-Acc  :", train_int8["file_acc"], " (base files:", train_int8["n_base_files"], ")")
+print("INT8 TEST  File-Acc  :", test_int8["file_acc"], " (base files:", test_int8["n_base_files"], ")")
+
+print("\nINT8 TEST Confusion (Window):")
+print(confusion_matrix(test_int8["y_true_windows"], test_int8["y_pred_windows"]))
+print("\nINT8 TEST Report (Window):")
+print(classification_report(test_int8["y_true_windows"], test_int8["y_pred_windows"], target_names=labels))
+
+print("\nINT8 TEST Confusion (File):")
+print(confusion_matrix(test_int8["y_true_files"], test_int8["y_pred_files"]))
+print("\nINT8 TEST Report (File):")
+print(classification_report(test_int8["y_true_files"], test_int8["y_pred_files"], target_names=labels))
+
+# ------------------------------------------------------------
+# Save a short report file
+# ------------------------------------------------------------
+def fmt(x):
+    return f"{x:.6f}"
+
+report = []
+report.append("STEP 6: TFLite Quantization Report\n")
+report.append(f"FP32 TFLite: {TFLITE_FP32_PATH}\n")
+report.append(f"INT8 TFLite: {TFLITE_INT8_PATH}\n\n")
+report.append(f"FP32 size bytes: {fp32_size}\n")
+report.append(f"INT8 size bytes: {int8_size}\n")
+if fp32_size > 0:
+    report.append(f"INT8/FP32 ratio: {int8_size / fp32_size}\n")
+report.append("\n")
+
+report.append("=== FP32 RESULTS ===\n")
+report.append(f"Train Window-Acc: {fmt(train_fp32['win_acc'])}\n")
+report.append(f"Test  Window-Acc: {fmt(test_fp32['win_acc'])}\n")
+report.append(f"Train File-Acc  : {fmt(train_fp32['file_acc'])} (n={train_fp32['n_base_files']})\n")
+report.append(f"Test  File-Acc  : {fmt(test_fp32['file_acc'])} (n={test_fp32['n_base_files']})\n\n")
+
+report.append("=== INT8 RESULTS ===\n")
+report.append(f"Train Window-Acc: {fmt(train_int8['win_acc'])}\n")
+report.append(f"Test  Window-Acc: {fmt(test_int8['win_acc'])}\n")
+report.append(f"Train File-Acc  : {fmt(train_int8['file_acc'])} (n={train_int8['n_base_files']})\n")
+report.append(f"Test  File-Acc  : {fmt(test_int8['file_acc'])} (n={test_int8['n_base_files']})\n\n")
+
+with open(REPORT_PATH, "w", encoding="utf-8") as f:
+    f.writelines(report)
+
+print("\n✅ Saved report:", REPORT_PATH)
+print("\n✅ Step 6 fertig (FP32 vs INT8 Quantisierung + Evaluation)")
+
