@@ -1,0 +1,213 @@
+import os, json
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+# =============================
+# PATHS
+# =============================
+STEP3_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step3"
+STEP4_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step4_dt_tuned"
+MODEL_PATH = os.path.join(STEP4_DIR, "decision_tree_tuned.joblib")
+TRAIN_BASES_PATH = os.path.join(STEP4_DIR, "train_base_ids.csv")
+TEST_BASES_PATH  = os.path.join(STEP4_DIR, "test_base_ids.csv")
+
+OUT_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step6_dt_quant_hard"
+os.makedirs(OUT_DIR, exist_ok=True)
+QPARAMS_PATH = os.path.join(OUT_DIR, "quant_params.json")
+
+# =============================
+# SETTINGS (same as training)
+# =============================
+BASE_COLS = ["AX(g)", "AY(g)", "AZ(g)", "GX(deg/s)", "GY(deg/s)", "GZ(deg/s)"]
+WINDOW_SIZE = 256
+STRIDE = 128  # keep same as training for fair comparison
+
+# =============================
+# FEATURES (same as training)
+# =============================
+def get_base_id(filename):
+    return filename.replace(".csv", "").split("__")[0]
+
+def features_1d(x):
+    x = np.asarray(x, dtype=float)
+    mean = np.mean(x)
+    std  = np.std(x)  # ddof=0
+    mn   = np.min(x)
+    mx   = np.max(x)
+    rms  = np.sqrt(np.mean(x * x))
+    med  = np.median(x)
+    q25  = np.percentile(x, 25)
+    q75  = np.percentile(x, 75)
+    iqr  = q75 - q25
+    energy = np.mean(x * x)
+    return [mean, std, mn, mx, rms, med, iqr, energy]
+
+feat_names_1d = ["mean", "std", "min", "max", "rms", "median", "iqr", "energy"]
+
+def build_channels(df):
+    AX = df["AX(g)"].astype(float).to_numpy()
+    AY = df["AY(g)"].astype(float).to_numpy()
+    AZ = df["AZ(g)"].astype(float).to_numpy()
+    GX = df["GX(deg/s)"].astype(float).to_numpy()
+    GY = df["GY(deg/s)"].astype(float).to_numpy()
+    GZ = df["GZ(deg/s)"].astype(float).to_numpy()
+
+    acc_mag  = np.sqrt(AX*AX + AY*AY + AZ*AZ)
+    gyro_mag = np.sqrt(GX*GX + GY*GY + GZ*GZ)
+
+    chans = {
+        "AX": AX, "AY": AY, "AZ": AZ,
+        "GX": GX, "GY": GY, "GZ": GZ,
+        "acc_mag": acc_mag,
+        "gyro_mag": gyro_mag
+    }
+
+    # jerk
+    for k in list(chans.keys()):
+        x = chans[k]
+        chans[k + "_jerk"] = np.diff(x, prepend=x[0])
+
+    return chans
+
+def make_feature_order():
+    base_names = ["AX", "AY", "AZ", "GX", "GY", "GZ", "acc_mag", "gyro_mag"]
+    jerk_names = [n + "_jerk" for n in base_names]
+    ch_names = base_names + jerk_names
+
+    feature_names = []
+    for cn in ch_names:
+        for fn in feat_names_1d:
+            feature_names.append(cn + "_" + fn)
+    return ch_names, feature_names
+
+CHANNEL_NAMES, FEATURE_NAMES = make_feature_order()
+
+def load_windows_df(step3_dir, keep_base_ids=None):
+    rows = []
+    for label in os.listdir(step3_dir):
+        label_path = os.path.join(step3_dir, label)
+        if not os.path.isdir(label_path):
+            continue
+
+        for file in os.listdir(label_path):
+            if not file.endswith(".csv"):
+                continue
+
+            base_id = get_base_id(file)
+            if keep_base_ids is not None and base_id not in keep_base_ids:
+                continue
+
+            fp = os.path.join(label_path, file)
+            try:
+                df = pd.read_csv(fp)
+            except:
+                continue
+
+            if any(c not in df.columns for c in BASE_COLS):
+                continue
+
+            n = len(df)
+            if n < WINDOW_SIZE:
+                continue
+
+            chans = build_channels(df)
+
+            start = 0
+            while start + WINDOW_SIZE <= n:
+                feats = []
+                for cn in CHANNEL_NAMES:
+                    x = chans[cn][start:start + WINDOW_SIZE]
+                    feats += features_1d(x)
+                rows.append([label, base_id] + feats)
+                start += STRIDE
+
+    if len(rows) == 0:
+        return None
+
+    cols = ["label", "base_id"] + FEATURE_NAMES
+    return pd.DataFrame(rows, columns=cols)
+
+# =============================
+# INT8 Quantization (per feature)
+# =============================
+def compute_int8_params(X_train):
+    mins = X_train.min(axis=0)
+    maxs = X_train.max(axis=0)
+    max_abs = np.maximum(np.abs(mins), np.abs(maxs))
+    scale = (max_abs / 127.0).astype(np.float32)
+    scale = np.maximum(scale, 1e-8).astype(np.float32)  # avoid div0
+    zero_point = np.zeros_like(scale, dtype=np.int32)   # symmetric
+    return scale, zero_point
+
+def quantize_int8(X, scale, zero_point):
+    x_q = np.round(X / scale + zero_point).astype(np.int32)
+    x_q = np.clip(x_q, -128, 127).astype(np.int8)
+    return x_q
+
+def dequantize_int8(Xq, scale, zero_point):
+    return (Xq.astype(np.float32) - zero_point) * scale
+
+# =============================
+# MAIN
+# =============================
+if not os.path.exists(MODEL_PATH):
+    raise SystemExit(f"❌ Model not found: {MODEL_PATH}")
+
+model = joblib.load(MODEL_PATH)
+
+train_ids = set(pd.read_csv(TRAIN_BASES_PATH)["base_id"].astype(str).tolist())
+test_ids  = set(pd.read_csv(TEST_BASES_PATH )["base_id"].astype(str).tolist())
+print("Leakage check (muss 0 sein):", len(train_ids.intersection(test_ids)))
+
+print("\nLoading TRAIN windows (for quant params)...")
+df_train = load_windows_df(STEP3_DIR, keep_base_ids=train_ids)
+print("Train windows:", 0 if df_train is None else len(df_train))
+
+print("\nLoading TEST windows (HARD TEST)...")
+df_test = load_windows_df(STEP3_DIR, keep_base_ids=test_ids)
+if df_test is None or len(df_test) == 0:
+    raise SystemExit("❌ No test windows found. Maybe test_ids not matching Step3 files?")
+print("Test windows:", len(df_test))
+
+X_train = df_train[FEATURE_NAMES].to_numpy(dtype=np.float32)
+y_train = df_train["label"].to_numpy()
+
+X_test  = df_test[FEATURE_NAMES].to_numpy(dtype=np.float32)
+y_test  = df_test["label"].to_numpy()
+
+# -------------------------
+# FLOAT EVAL (hard test)
+# -------------------------
+print("\n===== FLOAT HARD TEST =====")
+pred_float = model.predict(X_test)
+print("✅ Float Acc:", accuracy_score(y_test, pred_float))
+print("Confusion Matrix (float):\n", confusion_matrix(y_test, pred_float))
+print("\nReport (float):\n", classification_report(y_test, pred_float))
+
+# -------------------------
+# INT8-feature EVAL (hard test)
+# -------------------------
+scale, zero_point = compute_int8_params(X_train)
+
+params = {
+    "feature_names": FEATURE_NAMES,
+    "scale": scale.tolist(),
+    "zero_point": zero_point.tolist(),
+    "note": "symmetric int8 per feature: x_q=round(x/scale), clamp [-128,127], x=(x_q-zp)*scale"
+}
+with open(QPARAMS_PATH, "w", encoding="utf-8") as f:
+    json.dump(params, f, indent=2)
+
+Xq_test  = quantize_int8(X_test, scale, zero_point)
+Xdq_test = dequantize_int8(Xq_test, scale, zero_point)
+
+print("\n===== INT8-FEATURE HARD TEST =====")
+pred_int8 = model.predict(Xdq_test)
+print("✅ Int8-feature Acc:", accuracy_score(y_test, pred_int8))
+print("Confusion Matrix (int8):\n", confusion_matrix(y_test, pred_int8))
+print("\nReport (int8):\n", classification_report(y_test, pred_int8))
+
+print("\nSaved quant params:", QPARAMS_PATH)
+print("✅ Step6 hard test finished.")
