@@ -1,0 +1,556 @@
+#include <M5Unified.h>
+#include "decision_tree_model_q.h"   // <-- dein quantisiertes C-Header (aus Python Export)
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+#include <math.h>
+#include <string.h>
+#include <algorithm>
+
+// =========================
+// iPhone Hotspot STA (optional)
+// =========================
+static const char* WIFI_SSID = "Abdelmounaim";
+static const char* WIFI_PASS = "1234567800";
+
+// =========================
+// ATOMS3 Access Point (recommended)
+// iPhone connects to this AP and opens: http://192.168.4.1
+// =========================
+static const char* AP_SSID = "ATOMS3-RoadAI";
+static const char* AP_PASS = "12345678"; // min 8 chars
+
+// =========================
+// IMU API switch (depends on M5Unified version)
+// 0 = getAccel/getGyro
+// 1 = getAccelData/getGyroData
+// =========================
+#define IMU_API_GETACCELDATA 0
+
+// If accel is m/s^2 instead of g, set to 1
+#define ACC_IN_MPS2 0
+
+// =========================
+// Orientation handling
+// =========================
+#define ROT_Z_DEG 90   // 0, 90, 180, 270
+#define FLIP_X 0
+#define FLIP_Y 0
+#define FLIP_Z 0
+
+// =========================
+// Config (MUSS zum Training passen)
+// Training: WINDOW_SIZE=256, STRIDE=128
+// =========================
+static constexpr float FS_HZ = 50.0f;
+static constexpr int   WIN_SAMPLES = 256;
+static constexpr int   HOP_SAMPLES = 128;
+
+static constexpr float ACC_GRAVITY_FC_HZ = 0.3f;
+static constexpr float GYRO_BIAS_FC_HZ   = 0.1f;
+
+static constexpr bool  PRINT_SERIAL = true;
+
+// =========================
+// Ergebnisse auf Deutsch
+// (Klassen-Reihenfolge muss zum Modell passen!)
+// Bei dir: 0=Asphalt(3adi), 1=Pflaster(mobalat), 2=Schotter(trabi)
+// =========================
+static const char* const ROAD_CLASS_DE[DT_N_CLASSES] = {
+  "Asphalt",
+  "Pflaster",
+  "Schotter"
+};
+
+// =========================
+// Web server
+// =========================
+WebServer server(80);
+
+// Shared state for web
+static float g_last_norm[6] = {0,0,0,0,0,0};
+static int   g_last_cls = 0;
+static float g_last_conf = 1.0f;
+static uint32_t g_last_pred_ms = 0;
+
+// =========================
+// Ring buffer: normalized signals [AX,AY,AZ,GX,GY,GZ]
+// =========================
+static float ringBuf[WIN_SAMPLES][6];
+static int   ringCount = 0;
+static int   ringHead  = 0;
+static int   hopCounter = 0;
+
+// Preprocessing state (gravity + gyro bias)
+static float g_est[3] = {0,0,0};
+static float gyro_bias[3] = {0,0,0};
+static float acc_alpha = 0.0f;
+static float gyro_alpha = 0.0f;
+
+// "Step2 ähnlich": laufende Normalisierung (EMA mean/std) pro Achse
+static float norm_mu[6]  = {0,0,0,0,0,0};
+static float norm_var[6] = {1,1,1,1,1,1};
+static float norm_alpha  = 0.01f;   // 0.005..0.02 je nach Stabilität
+
+// Features (muss DT_N_FEATURES=128 sein)
+static float feat[DT_N_FEATURES];
+
+// --------------------------- EMA alpha ---------------------------
+static float ema_alpha(float fc_hz, float fs_hz) {
+  if (fc_hz <= 0.0f || fs_hz <= 0.0f) return 1.0f;
+  return 1.0f - expf(-2.0f * (float)M_PI * fc_hz / fs_hz);
+}
+
+// --------------------------- Orientation helpers ---------------------------
+static inline void rotate_xy(float& x, float& y) {
+#if ROT_Z_DEG == 0
+  (void)x; (void)y;
+#elif ROT_Z_DEG == 90
+  float nx = y;
+  float ny = -x;
+  x = nx; y = ny;
+#elif ROT_Z_DEG == 180
+  x = -x; y = -y;
+#elif ROT_Z_DEG == 270
+  float nx = -y;
+  float ny = x;
+  x = nx; y = ny;
+#endif
+}
+
+static inline void apply_orientation(float& ax, float& ay, float& az,
+                                     float& gx, float& gy, float& gz) {
+  rotate_xy(ax, ay);
+  rotate_xy(gx, gy);
+
+#if FLIP_X
+  ax = -ax; gx = -gx;
+#endif
+#if FLIP_Y
+  ay = -ay; gy = -gy;
+#endif
+#if FLIP_Z
+  az = -az; gz = -gz;
+#endif
+}
+
+// --------------------------- Running normalization (EMA mean/std) ---------------------------
+static inline float ema_norm(float x, int i) {
+  float mu = norm_mu[i] = norm_alpha * x + (1.0f - norm_alpha) * norm_mu[i];
+  float d  = x - mu;
+  float v  = norm_var[i] = norm_alpha * (d*d) + (1.0f - norm_alpha) * norm_var[i];
+  float stdv = sqrtf(v) + 1e-6f;
+  return d / stdv;
+}
+
+// --------------------------- IMU read ---------------------------
+static bool readIMU(float& ax_g, float& ay_g, float& az_g,
+                    float& gx_dps, float& gy_dps, float& gz_dps) {
+  if (!M5.Imu.isEnabled()) return false;
+
+  float ax, ay, az;
+  float gx, gy, gz;
+
+#if IMU_API_GETACCELDATA
+  bool okA = M5.Imu.getAccelData(&ax, &ay, &az);
+  bool okG = M5.Imu.getGyroData(&gx, &gy, &gz);
+#else
+  bool okA = M5.Imu.getAccel(&ax, &ay, &az);
+  bool okG = M5.Imu.getGyro(&gx, &gy, &gz);
+#endif
+  if (!okA || !okG) return false;
+
+#if ACC_IN_MPS2
+  ax_g = ax / 9.80665f;
+  ay_g = ay / 9.80665f;
+  az_g = az / 9.80665f;
+#else
+  ax_g = ax; ay_g = ay; az_g = az;
+#endif
+
+  gx_dps = gx; gy_dps = gy; gz_dps = gz;
+  return true;
+}
+
+// --------------------------- Preprocess sample ---------------------------
+// Näherung zu deinem Python Step2 (zentrieren+skalieren), hier als EMA in Echtzeit.
+static void preprocess_sample(
+  float ax_g, float ay_g, float az_g,
+  float gx_dps, float gy_dps, float gz_dps,
+  float out_norm[6]
+) {
+  apply_orientation(ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps);
+
+  // gravity estimate (EMA)
+  g_est[0] = acc_alpha * ax_g + (1.0f - acc_alpha) * g_est[0];
+  g_est[1] = acc_alpha * ay_g + (1.0f - acc_alpha) * g_est[1];
+  g_est[2] = acc_alpha * az_g + (1.0f - acc_alpha) * g_est[2];
+
+  float ax_lin = ax_g - g_est[0];
+  float ay_lin = ay_g - g_est[1];
+  float az_lin = az_g - g_est[2];
+
+  // gyro bias (slow EMA)
+  gyro_bias[0] = gyro_alpha * gx_dps + (1.0f - gyro_alpha) * gyro_bias[0];
+  gyro_bias[1] = gyro_alpha * gy_dps + (1.0f - gyro_alpha) * gyro_bias[1];
+  gyro_bias[2] = gyro_alpha * gz_dps + (1.0f - gyro_alpha) * gyro_bias[2];
+
+  float gx_d = gx_dps - gyro_bias[0];
+  float gy_d = gy_dps - gyro_bias[1];
+  float gz_d = gz_dps - gyro_bias[2];
+
+  float raw[6] = {ax_lin, ay_lin, az_lin, gx_d, gy_d, gz_d};
+
+  for (int i = 0; i < 6; i++) {
+    out_norm[i] = ema_norm(raw[i], i);
+  }
+}
+
+// --------------------------- Ring buffer ---------------------------
+static void ring_push(const float s6[6]) {
+  for (int i = 0; i < 6; i++) ringBuf[ringHead][i] = s6[i];
+  ringHead = (ringHead + 1) % WIN_SAMPLES;
+  if (ringCount < WIN_SAMPLES) ringCount++;
+}
+
+static void ring_copy_window(float outWin[WIN_SAMPLES][6]) {
+  int start = (ringCount == WIN_SAMPLES) ? ringHead : 0;
+  for (int i = 0; i < WIN_SAMPLES; i++) {
+    int idx = (start + i) % WIN_SAMPLES;
+    for (int c = 0; c < 6; c++) outWin[i][c] = ringBuf[idx][c];
+  }
+}
+
+// --------------------------- Stats: mean,std,min,max,rms,median,iqr,energy ---------------------------
+static inline void stats8(const float* x, int n,
+                          float& mean, float& stdv, float& mn, float& mx,
+                          float& rms, float& med, float& iqr, float& energy)
+{
+  float s=0.0f, s2=0.0f;
+  mn = 1e30f; mx = -1e30f;
+
+  for (int i=0; i<n; i++) {
+    float v = x[i];
+    s  += v;
+    s2 += v*v;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+
+  mean = s / (float)n;
+  energy = s2 / (float)n;
+  rms = sqrtf(energy);
+
+  float var = (s2 / (float)n) - mean*mean;
+  if (var < 1e-12f) var = 1e-12f;
+  stdv = sqrtf(var);
+
+  // median + IQR via sort copy
+  static float tmp[WIN_SAMPLES];
+  memcpy(tmp, x, n * sizeof(float));
+  std::sort(tmp, tmp + n);
+
+  if (n & 1) med = tmp[n/2];
+  else med = 0.5f * (tmp[n/2 - 1] + tmp[n/2]);
+
+  auto percentile = [&](float p01) -> float {
+    float idx = p01 * (n - 1);
+    int i0 = (int)floorf(idx);
+    int i1 = i0 + 1;
+    if (i1 >= n) return tmp[n-1];
+    float frac = idx - (float)i0;
+    return tmp[i0] * (1.0f - frac) + tmp[i1] * frac;
+  };
+
+  float q25 = percentile(0.25f);
+  float q75 = percentile(0.75f);
+  iqr = q75 - q25;
+}
+
+// --------------------------- Feature extraction: 16 channels * 8 stats = 128 ---------------------------
+// Channels: AX,AY,AZ,GX,GY,GZ,acc_mag,gyro_mag + jerks davon
+static int extract_features_128(const float window[WIN_SAMPLES][6], float* out_feat)
+{
+  static float AX[WIN_SAMPLES], AY[WIN_SAMPLES], AZ[WIN_SAMPLES];
+  static float GX[WIN_SAMPLES], GY[WIN_SAMPLES], GZ[WIN_SAMPLES];
+  static float acc_mag[WIN_SAMPLES], gyro_mag[WIN_SAMPLES];
+
+  for (int i = 0; i < WIN_SAMPLES; i++) {
+    AX[i] = window[i][0]; AY[i] = window[i][1]; AZ[i] = window[i][2];
+    GX[i] = window[i][3]; GY[i] = window[i][4]; GZ[i] = window[i][5];
+    acc_mag[i]  = sqrtf(AX[i]*AX[i] + AY[i]*AY[i] + AZ[i]*AZ[i]);
+    gyro_mag[i] = sqrtf(GX[i]*GX[i] + GY[i]*GY[i] + GZ[i]*GZ[i]);
+  }
+
+  static float ch[16][WIN_SAMPLES];
+  float* base[8] = {AX, AY, AZ, GX, GY, GZ, acc_mag, gyro_mag};
+
+  for (int k = 0; k < 8; k++) {
+    memcpy(ch[k], base[k], WIN_SAMPLES * sizeof(float));
+    ch[k+8][0] = 0.0f;
+    for (int i = 1; i < WIN_SAMPLES; i++) {
+      ch[k+8][i] = base[k][i] - base[k][i-1];
+    }
+  }
+
+  int idx = 0;
+  for (int k = 0; k < 16; k++) {
+    float mean, stdv, mn, mx, rms, med, iqr, energy;
+    stats8(ch[k], WIN_SAMPLES, mean, stdv, mn, mx, rms, med, iqr, energy);
+
+    out_feat[idx++] = mean;
+    out_feat[idx++] = stdv;
+    out_feat[idx++] = mn;
+    out_feat[idx++] = mx;
+    out_feat[idx++] = rms;
+    out_feat[idx++] = med;
+    out_feat[idx++] = iqr;
+    out_feat[idx++] = energy;
+  }
+  return idx; // 128
+}
+
+// --------------------------- Display ---------------------------
+static void show_result(int cls, float conf01) {
+  M5.Display.clear();
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(0, 0);
+
+  M5.Display.printf("Strassentyp:\n%s\n\n", ROAD_CLASS_DE[cls]);
+  M5.Display.printf("Sicherheit:\n%.1f%%\n", conf01 * 100.0f);
+}
+
+// =========================
+// Web UI (Polling)
+// =========================
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><html><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ATOMS3 Road AI</title>
+<style>
+body{font-family:system-ui,Arial;margin:12px;}
+.row{display:flex;gap:12px;flex-wrap:wrap;}
+.card{border:1px solid #ddd;border-radius:10px;padding:10px;min-width:260px;}
+canvas{border:1px solid #ddd;border-radius:10px;}
+.big{font-size:20px;font-weight:700;}
+.muted{color:#666;}
+</style></head><body>
+<div class="row">
+  <div class="card">
+    <div class="big">Straßentyp: <span id="road">-</span></div>
+    <div class="big">Sicherheit: <span id="conf">-</span></div>
+    <div class="muted" id="ipinfo">-</div>
+  </div>
+  <div class="card">
+    <div class="big">Live IMU</div>
+    <div class="muted">AX/AY/AZ (norm), GX/GY/GZ (norm)</div>
+  </div>
+</div>
+<p></p>
+<canvas id="cv" width="360" height="420"></canvas>
+
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const N = 256;
+const buf = {ax:Array(N).fill(0),ay:Array(N).fill(0),az:Array(N).fill(0),gx:Array(N).fill(0),gy:Array(N).fill(0),gz:Array(N).fill(0)};
+function push(a,v){a.push(v); if(a.length>N)a.shift();}
+
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.fillStyle="#000"; ctx.font="14px system-ui";
+  ctx.fillText("Accel",10,18); ctx.fillText("Gyro",10,218);
+  ctx.strokeStyle="#eee";
+  for(let y=30;y<200;y+=20){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(cv.width,y);ctx.stroke();}
+  for(let y=230;y<cv.height;y+=20){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(cv.width,y);ctx.stroke();}
+  function plot(series,y0,h,stroke){
+    let m=0.1; for(const v of series)m=Math.max(m,Math.abs(v));
+    const scale=(h*0.45)/m, dx=cv.width/(series.length-1);
+    ctx.strokeStyle=stroke; ctx.beginPath();
+    for(let i=0;i<series.length;i++){
+      const x=i*dx, y=y0+h/2 - series[i]*scale;
+      if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+  plot(buf.ax,30,170,"#d00"); plot(buf.ay,30,170,"#0a0"); plot(buf.az,30,170,"#00a");
+  plot(buf.gx,230,170,"#d00"); plot(buf.gy,230,170,"#0a0"); plot(buf.gz,230,170,"#00a");
+  requestAnimationFrame(draw);
+}
+
+async function pollStatus(){
+  try{
+    const r=await fetch('/status',{cache:'no-store'});
+    const j=await r.json();
+    document.getElementById('road').textContent=j.road_de;
+    document.getElementById('conf').textContent=(j.conf*100).toFixed(1)+'%';
+    document.getElementById('ipinfo').textContent=j.info;
+  }catch(e){}
+  setTimeout(pollStatus, 600);
+}
+
+async function pollIMU(){
+  try{
+    const r=await fetch('/imu',{cache:'no-store'});
+    const j=await r.json();
+    push(buf.ax,j.ax); push(buf.ay,j.ay); push(buf.az,j.az);
+    push(buf.gx,j.gx); push(buf.gy,j.gy); push(buf.gz,j.gz);
+  }catch(e){}
+  setTimeout(pollIMU, 200);
+}
+
+draw(); pollStatus(); pollIMU();
+</script>
+</body></html>
+)HTML";
+
+// --------------------------- Web handlers ---------------------------
+static String ipInfoStr;
+
+static void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+static void handleStatus() {
+  char out[256];
+  snprintf(out, sizeof(out),
+    "{\"road_de\":\"%s\",\"conf\":%.6f,\"info\":\"%s\"}",
+    ROAD_CLASS_DE[g_last_cls], (double)g_last_conf, ipInfoStr.c_str()
+  );
+  server.send(200, "application/json", out);
+}
+
+static void handleIMU() {
+  char out[256];
+  snprintf(out, sizeof(out),
+    "{\"ax\":%.6f,\"ay\":%.6f,\"az\":%.6f,\"gx\":%.6f,\"gy\":%.6f,\"gz\":%.6f}",
+    (double)g_last_norm[0], (double)g_last_norm[1], (double)g_last_norm[2],
+    (double)g_last_norm[3], (double)g_last_norm[4], (double)g_last_norm[5]
+  );
+  server.send(200, "application/json", out);
+}
+
+// --------------------------- WiFi (AP+STA) ---------------------------
+static void wifiStartAPSTA() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+
+  WiFi.softAP(AP_SSID, AP_PASS);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) {
+    delay(200);
+  }
+
+  IPAddress staIP = WiFi.localIP();
+  ipInfoStr = "AP: http://192.168.4.1  | STA: ";
+  if (WiFi.status() == WL_CONNECTED) ipInfoStr += staIP.toString();
+  else ipInfoStr += "not connected";
+
+  if (PRINT_SERIAL) Serial.println(ipInfoStr);
+
+  // screen info
+  M5.Display.clear();
+  M5.Display.setCursor(0, 0);
+  M5.Display.setTextSize(2);
+  M5.Display.println("Web:");
+  M5.Display.println("AP: 192.168.4.1");
+  M5.Display.print("STA: ");
+  M5.Display.println((WiFi.status()==WL_CONNECTED) ? staIP.toString() : String("NC"));
+  M5.Display.println();
+  M5.Display.println("Connect iPhone to:");
+  M5.Display.println(AP_SSID);
+
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/imu", handleIMU);
+  server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
+  server.begin();
+}
+
+// =========================
+// Setup/Loop
+// =========================
+void setup() {
+  auto cfg = M5.config();
+  M5.begin(cfg);
+  Serial.begin(115200);
+
+  M5.Display.setRotation(0);
+  M5.Display.setTextSize(2);
+  M5.Display.clear();
+  M5.Display.setCursor(0, 0);
+  M5.Display.println("Road AI init...");
+
+  if (!M5.Imu.begin()) {
+    M5.Display.println("IMU FAIL");
+    while (true) delay(200);
+  }
+
+  acc_alpha  = ema_alpha(ACC_GRAVITY_FC_HZ, FS_HZ);
+  gyro_alpha = ema_alpha(GYRO_BIAS_FC_HZ,   FS_HZ);
+
+  // Prime state
+  float ax, ay, az, gx, gy, gz;
+  if (readIMU(ax, ay, az, gx, gy, gz)) {
+    apply_orientation(ax, ay, az, gx, gy, gz);
+    g_est[0] = ax; g_est[1] = ay; g_est[2] = az;
+    gyro_bias[0] = gx; gyro_bias[1] = gy; gyro_bias[2] = gz;
+  }
+
+  wifiStartAPSTA();
+}
+
+void loop() {
+  server.handleClient();
+
+  static uint32_t last_ms = 0;
+  uint32_t now = millis();
+  uint32_t period_ms = (uint32_t)(1000.0f / FS_HZ + 0.5f);
+  if (now - last_ms < period_ms) return;
+  last_ms = now;
+
+  float ax, ay, az, gx, gy, gz;
+  if (!readIMU(ax, ay, az, gx, gy, gz)) return;
+
+  float norm6[6];
+  preprocess_sample(ax, ay, az, gx, gy, gz, norm6);
+
+  for (int i = 0; i < 6; i++) g_last_norm[i] = norm6[i];
+
+  ring_push(norm6);
+  if (ringCount < WIN_SAMPLES) return;
+
+  hopCounter++;
+  if (hopCounter < HOP_SAMPLES) return;
+  hopCounter = 0;
+
+  static float win[WIN_SAMPLES][6];
+  ring_copy_window(win);
+
+  int nfeat = extract_features_128(win, feat);
+  if (nfeat != DT_N_FEATURES) return;
+
+  // --- Modellvorhersage (quantisiert) ---
+  // WICHTIG: in deinem Header heißt die Funktion entweder:
+  //   dt_predict_class_q16(feat)
+  // oder dt_predict(feat)
+  // Falls Compile-Error: ändere NUR diese eine Zeile.
+  int cls = dt_predict_class_q16(feat);
+  float conf = 1.0f;
+
+  g_last_cls = cls;
+  g_last_conf = conf;
+  g_last_pred_ms = millis();
+
+  show_result(g_last_cls, g_last_conf);
+
+  if (PRINT_SERIAL) {
+    Serial.printf("Strassentyp=%s  Sicherheit=%.3f\n",
+      ROAD_CLASS_DE[g_last_cls], g_last_conf
+    );
+  }
+}
