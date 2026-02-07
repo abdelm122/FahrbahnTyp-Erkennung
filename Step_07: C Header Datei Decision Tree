@@ -1,0 +1,146 @@
+import os
+import json
+import numpy as np
+import joblib
+
+# ======================================================
+# PATHS
+# ======================================================
+MODEL_PATH = r"C:\Users\Oulad\Downloads\Devi\Devi_step4_dt_tuned\decision_tree_tuned.joblib"
+OUT_DIR    = r"C:\Users\Oulad\Downloads\Devi\export_c_quant"
+OUT_HEADER = os.path.join(OUT_DIR, "decision_tree_model_q.h")
+OUT_JSON   = os.path.join(OUT_DIR, "quant_params_int16.json")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ======================================================
+# LOAD MODEL
+# ======================================================
+model = joblib.load(MODEL_PATH)
+tree = model.tree_
+
+feature   = tree.feature.astype(np.int32)
+threshold = tree.threshold.astype(np.float32)
+left      = tree.children_left.astype(np.int32)
+right     = tree.children_right.astype(np.int32)
+value     = tree.value
+
+n_nodes   = tree.node_count
+n_classes = value.shape[2]
+n_features = np.max(feature[feature >= 0]) + 1
+
+# ======================================================
+# LEAF CLASS
+# ======================================================
+leaf_class = np.full(n_nodes, -1, dtype=np.int32)
+for i in range(n_nodes):
+    if feature[i] < 0:
+        leaf_class[i] = int(np.argmax(value[i, 0]))
+
+# ======================================================
+# QUANTIZATION (INT16)
+# ======================================================
+# symmetric scaling: max_abs -> 32767
+max_abs = np.ones(n_features, dtype=np.float32)
+for f in range(n_features):
+    thrs = threshold[feature == f]
+    if len(thrs) > 0:
+        max_abs[f] = max(1e-8, np.max(np.abs(thrs)))
+
+mult = (32767.0 / max_abs).astype(np.float32)
+
+threshold_q = np.zeros(n_nodes, dtype=np.int16)
+for i in range(n_nodes):
+    f = feature[i]
+    if f >= 0:
+        q = int(round(threshold[i] * mult[f]))
+        q = max(-32768, min(32767, q))
+        threshold_q[i] = q
+
+# ======================================================
+# SAVE QUANT PARAMS (optional, for debug)
+# ======================================================
+with open(OUT_JSON, "w") as f:
+    json.dump({
+        "n_features": int(n_features),
+        "mult": mult.tolist(),
+        "note": "x_q = round(x * mult[f]), threshold_q = round(thr * mult[f])"
+    }, f, indent=2)
+
+# ======================================================
+# C ARRAY HELPERS
+# ======================================================
+def c_array(name, arr, ctype="int32_t", per_line=16):
+    s = f"static const {ctype} {name}[{len(arr)}] = {{\n  "
+    for i, v in enumerate(arr):
+        s += str(v)
+        if i != len(arr) - 1:
+            s += ", "
+        if (i + 1) % per_line == 0 and i != len(arr) - 1:
+            s += "\n  "
+    s += "\n};\n\n"
+    return s
+
+def c_array_float(name, arr):
+    s = f"static const float {name}[{len(arr)}] = {{\n  "
+    for i, v in enumerate(arr):
+        s += f"{v:.9g}f"
+        if i != len(arr) - 1:
+            s += ", "
+        if (i + 1) % 8 == 0 and i != len(arr) - 1:
+            s += "\n  "
+    s += "\n};\n\n"
+    return s
+
+# ======================================================
+# WRITE C HEADER
+# ======================================================
+h = ""
+h += "#ifndef DECISION_TREE_MODEL_Q_H\n"
+h += "#define DECISION_TREE_MODEL_Q_H\n\n"
+h += "#include <stdint.h>\n\n"
+
+h += f"#define DT_N_NODES {n_nodes}\n"
+h += f"#define DT_N_FEATURES {n_features}\n"
+h += f"#define DT_N_CLASSES {n_classes}\n\n"
+
+h += c_array("DT_FEATURE", feature, "int32_t")
+h += c_array("DT_LEFT", left, "int32_t")
+h += c_array("DT_RIGHT", right, "int32_t")
+h += c_array("DT_LEAF_CLASS", leaf_class, "int32_t")
+h += c_array("DT_THRESHOLD_Q", threshold_q.astype(np.int32), "int32_t")
+h += c_array_float("DT_MULT", mult)
+
+h += """
+static inline int16_t dt_q16(float x, float mult)
+{
+    int32_t q = (int32_t)(x * mult + (x >= 0 ? 0.5f : -0.5f));
+    if (q < -32768) q = -32768;
+    if (q >  32767) q =  32767;
+    return (int16_t)q;
+}
+
+static inline int dt_predict(const float *x)
+{
+    int32_t node = 0;
+    while (1)
+    {
+        int32_t f = DT_FEATURE[node];
+        if (f < 0)
+            return DT_LEAF_CLASS[node];
+
+        int16_t vq = dt_q16(x[f], DT_MULT[f]);
+        int32_t tq = DT_THRESHOLD_Q[node];
+
+        node = (vq <= tq) ? DT_LEFT[node] : DT_RIGHT[node];
+    }
+}
+"""
+
+h += "\n#endif\n"
+
+with open(OUT_HEADER, "w") as f:
+    f.write(h)
+
+print("✅ Quantized C header created:")
+print(OUT_HEADER)
