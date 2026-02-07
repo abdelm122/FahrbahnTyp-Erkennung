@@ -1,0 +1,294 @@
+import os, json
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+
+# =========================
+# PATHS
+# =========================
+STEP3_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step3"
+STEP4_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step4_dt_tuned"
+MODEL_PATH = os.path.join(STEP4_DIR, "decision_tree_tuned.joblib")
+TRAIN_BASES_PATH = os.path.join(STEP4_DIR, "train_base_ids.csv")
+TEST_BASES_PATH  = os.path.join(STEP4_DIR, "test_base_ids.csv")
+
+OUT_DIR = r"C:\Users\Oulad\Downloads\Devi\Devi_step6_dt_quant_model"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+QPARAMS_PATH = os.path.join(OUT_DIR, "quant_params_int16.json")
+OUT_HEADER   = os.path.join(OUT_DIR, "decision_tree_model_q.h")
+
+# =========================
+# SETTINGS (same as training)
+# =========================
+BASE_COLS = ["AX(g)", "AY(g)", "AZ(g)", "GX(deg/s)", "GY(deg/s)", "GZ(deg/s)"]
+WINDOW_SIZE = 256
+STRIDE = 128
+
+# =========================
+# FEATURES (same order as training)
+# =========================
+def get_base_id(filename):
+    return filename.replace(".csv", "").split("__")[0]
+
+def features_1d(x):
+    x = np.asarray(x, dtype=float)
+    mean = np.mean(x)
+    std  = np.std(x)
+    mn   = np.min(x)
+    mx   = np.max(x)
+    rms  = np.sqrt(np.mean(x * x))
+    med  = np.median(x)
+    q25  = np.percentile(x, 25)
+    q75  = np.percentile(x, 75)
+    iqr  = q75 - q25
+    energy = np.mean(x * x)
+    return [mean, std, mn, mx, rms, med, iqr, energy]
+
+feat_names_1d = ["mean", "std", "min", "max", "rms", "median", "iqr", "energy"]
+
+def build_channels(df):
+    AX = df["AX(g)"].astype(float).to_numpy()
+    AY = df["AY(g)"].astype(float).to_numpy()
+    AZ = df["AZ(g)"].astype(float).to_numpy()
+    GX = df["GX(deg/s)"].astype(float).to_numpy()
+    GY = df["GY(deg/s)"].astype(float).to_numpy()
+    GZ = df["GZ(deg/s)"].astype(float).to_numpy()
+
+    acc_mag  = np.sqrt(AX*AX + AY*AY + AZ*AZ)
+    gyro_mag = np.sqrt(GX*GX + GY*GY + GZ*GZ)
+
+    chans = {
+        "AX": AX, "AY": AY, "AZ": AZ,
+        "GX": GX, "GY": GY, "GZ": GZ,
+        "acc_mag": acc_mag,
+        "gyro_mag": gyro_mag
+    }
+    for k in list(chans.keys()):
+        x = chans[k]
+        chans[k + "_jerk"] = np.diff(x, prepend=x[0])
+    return chans
+
+def make_feature_order():
+    base_names = ["AX", "AY", "AZ", "GX", "GY", "GZ", "acc_mag", "gyro_mag"]
+    jerk_names = [n + "_jerk" for n in base_names]
+    ch_names = base_names + jerk_names
+
+    feature_names = []
+    for cn in ch_names:
+        for fn in feat_names_1d:
+            feature_names.append(cn + "_" + fn)
+    return ch_names, feature_names
+
+CHANNEL_NAMES, FEATURE_NAMES = make_feature_order()
+
+def load_windows_df(step3_dir, keep_base_ids):
+    rows = []
+    for label in os.listdir(step3_dir):
+        label_path = os.path.join(step3_dir, label)
+        if not os.path.isdir(label_path):
+            continue
+        for file in os.listdir(label_path):
+            if not file.endswith(".csv"):
+                continue
+            base_id = get_base_id(file)
+            if base_id not in keep_base_ids:
+                continue
+
+            fp = os.path.join(label_path, file)
+            try:
+                df = pd.read_csv(fp)
+            except:
+                continue
+            if any(c not in df.columns for c in BASE_COLS):
+                continue
+
+            n = len(df)
+            if n < WINDOW_SIZE:
+                continue
+
+            chans = build_channels(df)
+            start = 0
+            while start + WINDOW_SIZE <= n:
+                feats = []
+                for cn in CHANNEL_NAMES:
+                    x = chans[cn][start:start + WINDOW_SIZE]
+                    feats += features_1d(x)
+                rows.append([label, base_id] + feats)
+                start += STRIDE
+
+    if len(rows) == 0:
+        return None
+    cols = ["label", "base_id"] + FEATURE_NAMES
+    return pd.DataFrame(rows, columns=cols)
+
+# =========================
+# Quant params (INT16)
+# =========================
+def compute_int16_multipliers(X_train):
+    # symmetric: map max_abs -> 32767
+    mins = X_train.min(axis=0)
+    maxs = X_train.max(axis=0)
+    max_abs = np.maximum(np.abs(mins), np.abs(maxs)).astype(np.float32)
+    max_abs = np.maximum(max_abs, 1e-8)
+    mult = (32767.0 / max_abs).astype(np.float32)  # x_q = round(x * mult)
+    return mult
+
+def quantize_int16_features(X, mult):
+    q = np.round(X * mult).astype(np.int32)
+    q = np.clip(q, -32768, 32767).astype(np.int16)
+    return q
+
+def quantize_thresholds_int16(tree_feature, tree_threshold, mult):
+    n = len(tree_feature)
+    thr_q = np.zeros(n, dtype=np.int16)
+    for i in range(n):
+        f = int(tree_feature[i])
+        if f >= 0:
+            tq = int(np.round(float(tree_threshold[i]) * float(mult[f])))
+            if tq < -32768: tq = -32768
+            if tq >  32767: tq =  32767
+            thr_q[i] = np.int16(tq)
+        else:
+            thr_q[i] = 0
+    return thr_q
+
+# =========================
+# Export header helpers
+# =========================
+def c_array_int(name, arr, dtype="int32_t", per_line=16):
+    arr = np.asarray(arr).astype(int).tolist()
+    s = f"static const {dtype} {name}[{len(arr)}] = {{\n  "
+    for i, v in enumerate(arr):
+        s += str(v)
+        if i != len(arr) - 1:
+            s += ", "
+        if (i + 1) % per_line == 0 and i != len(arr) - 1:
+            s += "\n  "
+    s += "\n};\n\n"
+    return s
+
+def c_array_float(name, arr, per_line=8):
+    arr = np.asarray(arr).astype(float).tolist()
+    s = f"static const float {name}[{len(arr)}] = {{\n  "
+    for i, v in enumerate(arr):
+        s += f"{v:.9g}f"
+        if i != len(arr) - 1:
+            s += ", "
+        if (i + 1) % per_line == 0 and i != len(arr) - 1:
+            s += "\n  "
+    s += "\n};\n\n"
+    return s
+
+# =========================
+# MAIN
+# =========================
+model = joblib.load(MODEL_PATH)
+tree = model.tree_
+
+train_ids = set(pd.read_csv(TRAIN_BASES_PATH)["base_id"].astype(str).tolist())
+test_ids  = set(pd.read_csv(TEST_BASES_PATH )["base_id"].astype(str).tolist())
+print("Leakage check:", len(train_ids.intersection(test_ids)))
+
+df_train = load_windows_df(STEP3_DIR, train_ids)
+df_test  = load_windows_df(STEP3_DIR, test_ids)
+if df_train is None or df_test is None:
+    raise SystemExit("No windows found. Check paths/windowing.")
+
+X_train = df_train[FEATURE_NAMES].to_numpy(dtype=np.float32)
+y_train = df_train["label"].to_numpy()
+X_test  = df_test[FEATURE_NAMES].to_numpy(dtype=np.float32)
+y_test  = df_test["label"].to_numpy()
+
+# float baseline
+pred_float = model.predict(X_test)
+print("\nFLOAT acc:", accuracy_score(y_test, pred_float))
+
+# build quantized model parameters
+mult = compute_int16_multipliers(X_train)
+Xq_test = quantize_int16_features(X_test, mult)
+thr_q = quantize_thresholds_int16(tree.feature, tree.threshold, mult)
+
+# derive leaf_class
+left  = tree.children_left.astype(np.int32)
+right = tree.children_right.astype(np.int32)
+feat  = tree.feature.astype(np.int32)  # -2 leaf
+value = tree.value
+n_nodes = tree.node_count
+
+leaf_class = np.full(n_nodes, -1, dtype=np.int32)
+for i in range(n_nodes):
+    is_leaf = (left[i] == -1 and right[i] == -1) or (feat[i] < 0)
+    if is_leaf:
+        leaf_class[i] = int(np.argmax(value[i, 0, :]))
+
+# int16 inference in python (to sanity check)
+def predict_int16(tree_feat, tree_left, tree_right, tree_thr_q, Xq, leaf_class):
+    out = np.empty(Xq.shape[0], dtype=np.int32)
+    for i in range(Xq.shape[0]):
+        node = 0
+        while True:
+            f = int(tree_feat[node])
+            if f < 0:
+                out[i] = int(leaf_class[node])
+                break
+            v = int(Xq[i, f])
+            t = int(tree_thr_q[node])
+            node = int(tree_left[node]) if v <= t else int(tree_right[node])
+    return out
+
+pred_q_idx = predict_int16(feat, left, right, thr_q, Xq_test, leaf_class)
+pred_q = model.classes_[pred_q_idx]
+
+print("INT16-QUANT model acc:", accuracy_score(y_test, pred_q))
+print("INT16 CM:\n", confusion_matrix(y_test, pred_q))
+print("\nINT16 report:\n", classification_report(y_test, pred_q))
+
+# save params
+with open(QPARAMS_PATH, "w", encoding="utf-8") as f:
+    json.dump({
+        "feature_names": FEATURE_NAMES,
+        "mult": mult.tolist(),
+        "note": "INT16 quant model: x_q=round(x*mult[f]); thr_q=round(thr*mult[f]); compare x_q<=thr_q"
+    }, f, indent=2)
+
+# write quantized C header
+h = ""
+h += "#ifndef DECISION_TREE_MODEL_Q_H\n#define DECISION_TREE_MODEL_Q_H\n\n"
+h += "#include <stdint.h>\n#include <stddef.h>\n\n"
+h += f"#define DT_N_NODES {n_nodes}\n"
+h += f"#define DT_N_FEATURES {len(FEATURE_NAMES)}\n\n"
+
+h += c_array_int("DT_FEATURE", feat, dtype="int32_t")
+h += c_array_int("DT_LEFT", left, dtype="int32_t")
+h += c_array_int("DT_RIGHT", right, dtype="int32_t")
+h += c_array_int("DT_LEAF_CLASS", leaf_class, dtype="int32_t")
+h += c_array_int("DT_THRESHOLD_Q", thr_q.astype(np.int32), dtype="int32_t")
+h += c_array_float("DT_MULT", mult)
+
+h += "// Quantize one feature x (float) -> int16\n"
+h += "static inline int16_t dt_q16(float x, float mult){\n"
+h += "  int32_t q = (int32_t)(x*mult + (x>=0 ? 0.5f : -0.5f));\n"
+h += "  if(q < -32768) q = -32768;\n"
+h += "  if(q >  32767) q =  32767;\n"
+h += "  return (int16_t)q;\n}\n\n"
+
+h += "// Predict using quantized tree: input is FLOAT features, internally quantized to int16\n"
+h += "static inline int dt_predict_class_q16(const float *x){\n"
+h += "  int32_t node = 0;\n"
+h += "  while(1){\n"
+h += "    int32_t f = DT_FEATURE[node];\n"
+h += "    if(f < 0) return (int)DT_LEAF_CLASS[node];\n"
+h += "    int16_t vq = dt_q16(x[f], DT_MULT[f]);\n"
+h += "    int32_t tq = DT_THRESHOLD_Q[node];\n"
+h += "    node = (vq <= tq) ? DT_LEFT[node] : DT_RIGHT[node];\n"
+h += "  }\n}\n\n"
+
+h += "#endif\n"
+
+with open(OUT_HEADER, "w", encoding="utf-8") as f:
+    f.write(h)
+
+print("\nSaved quantized model header:", OUT_HEADER)
+print("Saved quant params:", QPARAMS_PATH)
